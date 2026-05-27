@@ -233,10 +233,10 @@ export class LucenaAgent {
     const { type, messageId } = command;
     switch (type) {
       case 'execute': return this.executeCommand(command);
-      case 'read_file': return this.readFileCmd(command);
+      case 'read_files': return this.readFileCmd(command);
       case 'write_file': return this.writeFileCmd(command);
       case 'list_files': return this.listFiles(command);
-      case 'list_dir': return this.listDir(command);
+      case 'list_directories': return this.listDir(command);
       case 'stat': return this.statFile(command);
       case 'delete_file': return this.deleteFile(command);
       case 'mkdir': return this.mkdirCmd(command);
