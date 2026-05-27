@@ -1,0 +1,36 @@
+{
+  "name": "@lucenaone/coder",
+  "version": "1.2.2",
+  "description": "Private tunnel for connecting LucenaCoder.com to your local folder. Always remains folder scoped while providing full terminal access.",
+  "type": "module",
+  "bin": {
+    "lucenacoder": "./bin/lucena.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "grammars",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node bin/lucena.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.0",
+    "execa": "^9.6.1",
+    "firebase": "^11.0.0",
+    "shell-quote": "^1.8.4",
+    "web-tree-sitter": "^0.26.9"
+  },
+  "keywords": [
+    "lucena",
+    "lucenacoder",
+    "tunnel",
+    "lucenaone"
+  ],
+  "author": "LucenaOne",
+  "license": "MIT"
+}
