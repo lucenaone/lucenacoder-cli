@@ -1,5 +1,5 @@
 import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, push, set, onChildAdded, onDisconnect, serverTimestamp, remove, get } from 'firebase/database';
+import { getDatabase, ref, push, set, update, onChildAdded, onDisconnect, serverTimestamp, remove, get } from 'firebase/database';
 import { spawn, spawnSync } from 'child_process';
 import { watch } from 'chokidar';
 import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'fs/promises';
@@ -17,7 +17,9 @@ const IGNORED_PATTERNS = [
   'coverage', '.coverage', 'target', 'out', '.gradle'
 ];
 
-const SEARCH_GLOB = '*.{js,jsx,ts,tsx,json,md,css,html,py,rb,go,rs}';
+const SEARCH_GLOB = '*.{js,jsx,ts,tsx,json,md,css,html,py,rb,go,rs,dart}';
+const TUNNEL_HEARTBEAT_INTERVAL_MS = 15_000;
+const REMOTE_STATUS_INTERVAL_MS = 15_000;
 
 // ── The CLI Jailer ──
 function getJailedPath(baseDir, rawPath) {
@@ -71,6 +73,7 @@ export class LucenaAgent {
     this.indexPromise = null; // The in-flight indexing promise
     this.browserConnected = false;
     this.remoteStatusTimer = null;
+    this.heartbeatTimer = null;
     this.commandClients = new Map();
     this.remoteControlRegistrationNotice = '';
     this.shell = new LucenaShell(this.cwd);
@@ -113,7 +116,7 @@ export class LucenaAgent {
     }).then((result) => {
       this.indexData = result;
       const { stats } = result;
-      process.stdout.write(`\r  ${'\x1b[32m'}✔ Indexed ${stats.filesParsed} files — ${stats.symbolCount} symbols, ${stats.stringCount} strings${'\x1b[0m'}  \n`);
+      process.stdout.write(`\r  ${'\x1b[32m'}✔ Indexed ${stats.filesParsed} files — ${stats.symbolCount} symbols${'\x1b[0m'}  \n`);
       if (this.browserConnected && this.db) {
         this.pushIndexSnapshot(result);
       }
@@ -130,18 +133,28 @@ export class LucenaAgent {
     await set(tunnelRef, {
       meta: {
         createdAt: serverTimestamp(),
+        lastHeartbeatAt: Date.now(),
         cwdName: basename(this.cwd),  // Never expose full cwd to the browser
         status: 'active',
+        online: true,
         pid: process.pid,
         platform: process.platform
       }
     });
 
     onChildAdded(ref(this.db, `.info`), () => {}); 
-    const presenceRef = ref(this.db, `tunnels/${this.tunnelId}/meta/online`);
-    await set(presenceRef, true);
-    onDisconnect(presenceRef).set(false);
-    onDisconnect(ref(this.db, `tunnels/${this.tunnelId}/meta/status`)).set('disconnected');
+    onDisconnect(tunnelRef).remove();
+
+    this.heartbeatTimer = setInterval(() => {
+      update(ref(this.db, `tunnels/${this.tunnelId}/meta`), {
+        lastHeartbeatAt: Date.now(),
+        cwdName: basename(this.cwd),
+        status: 'active',
+        online: true,
+        pid: process.pid,
+        platform: process.platform
+      }).catch(() => {});
+    }, TUNNEL_HEARTBEAT_INTERVAL_MS);
 
     // ── Listen for browser connect events ──
     // When the browser connects, push the pre-built index immediately
@@ -204,7 +217,6 @@ export class LucenaAgent {
     // Push as a single message — the browser hydrates from this
     set(snapshotRef, {
       symbols: index.symbols,
-      strings: index.strings,
       stats: index.stats,
       timestamp: serverTimestamp(),
     });
@@ -224,7 +236,6 @@ export class LucenaAgent {
     push(deltaRef, {
       filePath: delta.filePath,
       symbols: delta.symbols,
-      strings: delta.strings,
       timestamp: serverTimestamp(),
     });
   }
@@ -261,7 +272,7 @@ export class LucenaAgent {
       updatedAt: Date.now(),
     }).catch(() => {});
     publishStatus();
-    this.remoteStatusTimer = setInterval(publishStatus, 5000);
+    this.remoteStatusTimer = setInterval(publishStatus, REMOTE_STATUS_INTERVAL_MS);
     onDisconnect(statusRef).set({
       online: false,
       linkStatus: 'local',
@@ -515,17 +526,9 @@ export class LucenaAgent {
 
     if (this.watcher) await this.watcher.close();
     if (this.db) {
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
       if (this.remoteStatusTimer) clearInterval(this.remoteStatusTimer);
-      await set(ref(this.db, `tunnels/${this.tunnelId}/meta/online`), false);
-      await set(ref(this.db, `tunnels/${this.tunnelId}/meta/status`), 'disconnected');
-      await set(ref(this.db, `tunnels/${this.tunnelId}/remoteControl/desktop/status`), {
-        online: false,
-        linkStatus: 'local',
-        platform: process.platform,
-        projectName: basename(this.cwd),
-        workerStatus: 'offline',
-        updatedAt: Date.now(),
-      });
+      await remove(ref(this.db, `tunnels/${this.tunnelId}`));
     }
 
     this.connected = false;

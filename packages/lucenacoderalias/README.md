@@ -1,6 +1,6 @@
 # LucenaCoder Local Tunnel
 
-This package is the `npx lucenacoder` alias for [`@lucenaone/coder`](https://www.npmjs.com/package/@lucenaone/coder), the official local connection agent for [LucenaCoder](https://lucenacoder.com).
+The official local connection agent for [LucenaCoder](https://lucenacoder.com).
 
 Run it from a project folder when you want LucenaCoder to work with files on your machine instead of a browser-only workspace. It creates a folder-scoped realtime tunnel between your local project and LucenaCoder.
 
@@ -11,7 +11,6 @@ npx lucenacoder
 
 ## What This Package Does
 
-- Installs and runs `@lucenaone/coder`.
 - Connects the folder you run it from to LucenaCoder through Firebase Realtime Database.
 - Reads, writes, lists, searches, and runs commands only inside that selected folder.
 - Builds a local code index on your machine so LucenaCoder can understand the project faster.
@@ -19,7 +18,7 @@ npx lucenacoder
 - Prints a Tunnel ID and LucenaCoder URL so you can connect from the web app.
 - If your Pro token is already saved, registers the tunnel with your LucenaCoder account for Remote Control.
 
-That is the whole job: this package is the lightweight local worker entrypoint. The AI/model calls and Pro account checks live in LucenaCoder's cloud services.
+That is the whole job: this package is the lightweight local worker. The AI/model calls and Pro account checks live in LucenaCoder's cloud services.
 
 ## What Gets Sent
 
@@ -36,7 +35,7 @@ We want this to be boringly clear:
 - This does not scan your whole computer.
 - LucenaCoder file tools are scoped to the directory where you ran `npx lucenacoder`.
 - This does not run a hidden background daemon after you close the terminal process.
-- This does not make your local folder public. The Tunnel ID is a private connection handle; treat it like a temporary secret.
+- The Tunnel ID is a private connection handle; treat it like a temporary secret.
 
 ## Browser Mode, Local Tunnel, And Pro Remote Control
 
@@ -50,7 +49,7 @@ LucenaCoder can work in a few modes:
 
 Local AI access should not be mysterious.
 
-- LucenaCoder file tools are folder-scoped and resolve paths inside the folder where the command was started.
+- LucenaCoder file tools are folder-scoped and resolve paths inside the folder where the command was started, but agents are able to access beyond upon request.
 - Safe Mode is the default. Mutating terminal commands are blocked until approved.
 - Terminal commands run from the selected project folder. Read-only shell commands can still reference paths you explicitly ask them to, so review commands before approving broader access.
 - File edits are surfaced through LucenaCoder's approval flow when approval is required.
@@ -83,4 +82,4 @@ To disconnect, stop the process with `Ctrl+C`.
 
 ## Package Transparency
 
-This alias package loads `@lucenaone/coder`, which contains the local tunnel worker, local indexing code, shell safety policy, and tree-sitter grammars needed to run on your machine.
+This npm package contains the local tunnel worker, local indexing code, shell safety policy, and tree-sitter grammars needed to run on your machine. 

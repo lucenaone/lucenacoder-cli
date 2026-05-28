@@ -1,6 +1,6 @@
 // src/cli-indexer.js — Tree-sitter WASM indexer for the CLI agent
 // Runs on the user's machine at startup, parses all code files locally,
-// and builds a symbol + string index that can be pushed to the browser
+// and builds a symbol index that can be pushed to the browser
 // via RTDB when the tunnel connects.
 
 import { readFile, readdir } from 'fs/promises';
@@ -73,7 +73,6 @@ async function loadLanguage(langExt) {
 
 function extractChunks(rootNode, code) {
   const chunks = [];
-  const strings = [];
 
   function walk(node, depth, parentType) {
     const type = node.type;
@@ -87,7 +86,6 @@ function extractChunks(rootNode, code) {
         endByte: node.endIndex,
         text: node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -105,14 +103,12 @@ function extractChunks(rootNode, code) {
         text: node.text,
       });
       extractNestedNames(node, chunks, name);
-      extractStringsFromNode(node, strings);
       return;
     }
 
     // ── Function declarations ──
     if (type === 'function_declaration' || type === 'function_definition' || type === 'method_definition') {
       if (depth > 1) {
-        extractStringsFromNode(node, strings);
         return;
       }
       const nameNode = node.childForFieldName('name');
@@ -126,7 +122,6 @@ function extractChunks(rootNode, code) {
         endByte: node.endIndex,
         text: node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -151,7 +146,6 @@ function extractChunks(rootNode, code) {
             });
           }
         }
-        extractStringsFromNode(node, strings);
         return;
       }
 
@@ -168,7 +162,6 @@ function extractChunks(rootNode, code) {
         endByte: node.parent ? node.parent.endIndex : node.endIndex,
         text: node.parent ? node.parent.text : node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -184,7 +177,6 @@ function extractChunks(rootNode, code) {
         endByte: node.endIndex,
         text: node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -198,7 +190,6 @@ function extractChunks(rootNode, code) {
         endByte: node.endIndex,
         text: node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -214,7 +205,6 @@ function extractChunks(rootNode, code) {
         endByte: node.endIndex,
         text: node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -231,7 +221,6 @@ function extractChunks(rootNode, code) {
         endByte: node.endIndex,
         text: node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -247,7 +236,6 @@ function extractChunks(rootNode, code) {
         endByte: node.endIndex,
         text: node.text,
       });
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -256,7 +244,6 @@ function extractChunks(rootNode, code) {
       for (let i = 0; i < node.childCount; i++) {
         walk(node.child(i), depth, type);
       }
-      extractStringsFromNode(node, strings);
       return;
     }
 
@@ -267,7 +254,7 @@ function extractChunks(rootNode, code) {
   }
 
   walk(rootNode, 0, null);
-  return { chunks, strings };
+  return { chunks };
 }
 
 function isExportedNode(node) {
@@ -295,32 +282,6 @@ function extractNestedNames(node, chunks, parentName) {
       }
     }
   }
-}
-
-function extractStringsFromNode(node, strings) {
-  const stringTypes = new Set([
-    'string', 'string_literal', 'template_string', 'template_literal',
-    'comment', 'line_comment', 'block_comment', 'jsx_text',
-  ]);
-
-  function walkStrings(n) {
-    if (stringTypes.has(n.type)) {
-      const text = n.text.trim();
-      if (text.length > 1 && text.length < 500) {
-        strings.push({
-          text,
-          startByte: n.startIndex,
-          endByte: n.endIndex,
-        });
-      }
-      return;
-    }
-    for (let i = 0; i < n.childCount; i++) {
-      walkStrings(n.child(i));
-    }
-  }
-
-  walkStrings(node);
 }
 
 // ── File Tree Walker ──
@@ -360,8 +321,6 @@ export async function buildIndex(cwd, onProgress) {
 
   // Symbol index: Array<{ name, filePath, type, exported, parent }>
   const symbolEntries = [];
-  // String index: Array<{ text, filePath }>
-  const stringEntries = [];
 
   let parsed = 0;
   let errors = 0;
@@ -373,7 +332,7 @@ export async function buildIndex(cwd, onProgress) {
       const parser = new _Parser();
       parser.setLanguage(lang);
       const tree = parser.parse(code);
-      const { chunks, strings } = extractChunks(tree.rootNode, code);
+      const { chunks } = extractChunks(tree.rootNode, code);
       tree.delete();
 
       // Build symbol entries
@@ -385,14 +344,8 @@ export async function buildIndex(cwd, onProgress) {
           type: chunk.type,
           exported: chunk.exported || false,
           parent: chunk.parent || null,
-        });
-      }
-
-      // Build string entries
-      for (const str of strings) {
-        stringEntries.push({
-          text: str.text,
-          filePath: file.filePath,
+          startByte: chunk.startByte || 0,
+          endByte: chunk.endByte || 0,
         });
       }
 
@@ -410,12 +363,10 @@ export async function buildIndex(cwd, onProgress) {
 
   return {
     symbols: symbolEntries,
-    strings: stringEntries,
     stats: {
       filesParsed: parsed,
       filesErrored: errors,
       symbolCount: symbolEntries.length,
-      stringCount: stringEntries.length,
     },
   };
 }
@@ -430,7 +381,7 @@ export async function reindexFile(cwd, relPath) {
   if (!langName) return null;
 
   const fullPath = join(cwd, relPath.replace(/^\//, ''));
-  if (!existsSync(fullPath)) return { filePath: relPath, symbols: [], strings: [] };
+  if (!existsSync(fullPath)) return { filePath: relPath, symbols: [] };
 
   try {
     const code = await readFile(fullPath, 'utf-8');
@@ -438,7 +389,7 @@ export async function reindexFile(cwd, relPath) {
     const parser = new _Parser();
     parser.setLanguage(lang);
     const tree = parser.parse(code);
-    const { chunks, strings } = extractChunks(tree.rootNode, code);
+    const { chunks } = extractChunks(tree.rootNode, code);
     tree.delete();
 
     const symbolEntries = [];
@@ -450,15 +401,12 @@ export async function reindexFile(cwd, relPath) {
         type: chunk.type,
         exported: chunk.exported || false,
         parent: chunk.parent || null,
+        startByte: chunk.startByte || 0,
+        endByte: chunk.endByte || 0,
       });
     }
 
-    const stringEntries = strings.map(s => ({
-      text: s.text,
-      filePath: relPath,
-    }));
-
-    return { filePath: relPath, symbols: symbolEntries, strings: stringEntries };
+    return { filePath: relPath, symbols: symbolEntries };
   } catch (err) {
     console.error(`[cli-indexer] Error re-indexing ${relPath}: ${err.message}`);
     return null;
