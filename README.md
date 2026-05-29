@@ -35,7 +35,7 @@ We want this to be boringly clear:
 - This does not scan your whole computer.
 - LucenaCoder file tools are scoped to the directory where you ran `npx lucenacoder`.
 - This does not run a hidden background daemon after you close the terminal process.
-- This does not make your local folder public. The Tunnel ID is a private connection handle; treat it like a temporary secret.
+- The Tunnel ID is a private connection handle; treat it like a temporary secret.
 
 ## Browser Mode, Local Tunnel, And Pro Remote Control
 
@@ -49,7 +49,7 @@ LucenaCoder can work in a few modes:
 
 Local AI access should not be mysterious.
 
-- LucenaCoder file tools are folder-scoped and resolve paths inside the folder where the command was started.
+- LucenaCoder file tools are folder-scoped and resolve paths inside the folder where the command was started, but agents are able to access beyond upon request.
 - Safe Mode is the default. Mutating terminal commands are blocked until approved.
 - Terminal commands run from the selected project folder. Read-only shell commands can still reference paths you explicitly ask them to, so review commands before approving broader access.
 - File edits are surfaced through LucenaCoder's approval flow when approval is required.

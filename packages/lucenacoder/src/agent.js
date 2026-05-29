@@ -4,18 +4,19 @@ import { spawn, spawnSync } from 'child_process';
 import { watch } from 'chokidar';
 import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'fs/promises';
 import { join, resolve, dirname, basename, relative, isAbsolute, extname } from 'path';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import { FIREBASE_CONFIG } from './config.js';
 import { buildIndex, reindexFile } from './cli-indexer.js';
 import { LucenaShell } from './lucena-shell.js';
 import { storeProToken } from './pro-token.js';
-
-const IGNORED_PATTERNS = [
-  'node_modules', '.git', '.next', '.wrangler', '.DS_Store',
-  'dist', 'build', '.cache', '.turbo', '.vercel', '.firebase',
-  '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache',
-  'coverage', '.coverage', 'target', 'out', '.gradle'
-];
+import { createWorkspaceIgnore } from './ignore-rules.js';
+import {
+  ensureWorkspaceBrainSqlite,
+  getWorkspaceBrainThread,
+  loadWorkspaceBrainState,
+  saveWorkspaceBrainState,
+  upsertWorkspaceBrainThread,
+} from './workspace-brain-sqlite.js';
 
 const SEARCH_GLOB = '*.{js,jsx,ts,tsx,json,md,css,html,py,rb,go,rs,dart}';
 const TUNNEL_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -77,6 +78,7 @@ export class LucenaAgent {
     this.commandClients = new Map();
     this.remoteControlRegistrationNotice = '';
     this.shell = new LucenaShell(this.cwd);
+    this.ignore = createWorkspaceIgnore(this.cwd);
   }
 
   /** Conditionally strip cwd — only in Browser Mode */
@@ -84,19 +86,18 @@ export class LucenaAgent {
     return this.stripCwd ? stripCwd(this.cwd, text) : text;
   }
 
+  _isIgnoredPath(fullPath) {
+    return this.ignore.ignoresPath(relative(this.cwd, fullPath));
+  }
+
   _scaffoldWorkspaceBrain() {
     const brainDir = join(this.cwd, '.WorkspaceBrain');
-    const subdirs = ['memories', 'skills', 'threads'];
+    const subdirs = ['skills'];
     try {
       if (!existsSync(brainDir)) mkdirSync(brainDir, { recursive: true });
       for (const sub of subdirs) {
         const subPath = join(brainDir, sub);
         if (!existsSync(subPath)) mkdirSync(subPath, { recursive: true });
-      }
-      // Scaffold workspace.json if it doesn't exist
-      const wsJson = join(brainDir, 'workspace.json');
-      if (!existsSync(wsJson)) {
-        writeFileSync(wsJson, JSON.stringify({ name: basename(this.cwd), createdAt: new Date().toISOString() }, null, 2));
       }
     } catch (err) {
       // Non-fatal — the brain is best-effort
@@ -107,24 +108,20 @@ export class LucenaAgent {
   async start() {
     // Ensure .WorkspaceBrain/ exists on disk with subdirectories
     this._scaffoldWorkspaceBrain();
+    await ensureWorkspaceBrainSqlite(this.cwd).catch((err) => {
+      console.warn('[workspace-brain] sqlite init failed:', err.message);
+    });
 
-    // ── Start indexing immediately on the CLI machine ──
+    // The tunnel URL must not become live until the CLI has the startup
+    // artifact the browser needs: file tree + AST symbol index.
     this.indexPromise = buildIndex(this.cwd, (progress) => {
       if (progress.phase === 'parsing' && progress.current > 0) {
         process.stdout.write(`\r  ${'\x1b[90m'}⏳ Indexing... ${progress.current}/${progress.total} files${'\x1b[0m'}`);
       }
-    }).then((result) => {
-      this.indexData = result;
-      const { stats } = result;
-      process.stdout.write(`\r  ${'\x1b[32m'}✔ Indexed ${stats.filesParsed} files — ${stats.symbolCount} symbols${'\x1b[0m'}  \n`);
-      if (this.browserConnected && this.db) {
-        this.pushIndexSnapshot(result);
-      }
-      return result;
-    }).catch((err) => {
-      console.warn(`\n  ${'\x1b[33m'}⚠ Indexing failed: ${err.message}${'\x1b[0m'}`);
-      return null;
     });
+    this.indexData = await this.indexPromise;
+    const { stats } = this.indexData;
+    process.stdout.write(`\r  ${'\x1b[32m'}✔ Indexed ${stats.filesParsed} files — ${stats.symbolCount} symbols across ${stats.fileCount} files${'\x1b[0m'}  \n`);
 
     this.app = initializeApp(FIREBASE_CONFIG, `agent-${this.tunnelId}`);
     this.db = getDatabase(this.app);
@@ -142,8 +139,9 @@ export class LucenaAgent {
       }
     });
 
-    onChildAdded(ref(this.db, `.info`), () => {}); 
+    onChildAdded(ref(this.db, `.info`), () => {});
     onDisconnect(tunnelRef).remove();
+    await this.publishStartupSnapshot();
 
     this.heartbeatTimer = setInterval(() => {
       update(ref(this.db, `tunnels/${this.tunnelId}/meta`), {
@@ -157,7 +155,8 @@ export class LucenaAgent {
     }, TUNNEL_HEARTBEAT_INTERVAL_MS);
 
     // ── Listen for browser connect events ──
-    // When the browser connects, push the pre-built index immediately
+    // Browser connect is presence/session metadata. The startup snapshot is
+    // already published before the tunnel URL is returned.
     onChildAdded(ref(this.db, `tunnels/${this.tunnelId}/browserConnect`), async (snapshot) => {
       const data = snapshot.val();
       if (!data) return;
@@ -176,10 +175,6 @@ export class LucenaAgent {
           console.log(this.remoteControlRegistrationNotice);
           this.remoteControlRegistrationNotice = '';
         }
-      }
-      
-      if (this.indexData) {
-        this.pushIndexSnapshot(this.indexData);
       }
     });
 
@@ -211,13 +206,13 @@ export class LucenaAgent {
     this.remoteControlRegistrationNotice = message || '';
   }
 
-  // ── Push the full pre-built index to the browser via RTDB ──
-  pushIndexSnapshot(index) {
+  // ── Publish the startup artifact before exposing the tunnel URL ──
+  async publishStartupSnapshot() {
     const snapshotRef = ref(this.db, `tunnels/${this.tunnelId}/indexSnapshot`);
-    // Push as a single message — the browser hydrates from this
-    set(snapshotRef, {
-      symbols: index.symbols,
-      stats: index.stats,
+    await set(snapshotRef, {
+      files: this.indexData.files,
+      symbols: this.indexData.symbols,
+      stats: this.indexData.stats,
       timestamp: serverTimestamp(),
     });
     console.log(`  ${'\x1b[36m'}📡 Index snapshot pushed to browser${'\x1b[0m'}`);
@@ -225,6 +220,8 @@ export class LucenaAgent {
 
   // ── Push an incremental delta when a file changes ──
   async pushIndexDelta(relPath) {
+    if (this.ignore.ignoresPath(relPath)) return;
+
     const ext = extname(relPath);
     const SUPPORTED_EXTS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.rb', '.go', '.rs'];
     if (!SUPPORTED_EXTS.includes(ext)) return;
@@ -246,6 +243,12 @@ export class LucenaAgent {
       case 'execute': return this.executeCommand(command);
       case 'read_files': return this.readFileCmd(command);
       case 'write_file': return this.writeFileCmd(command);
+      case 'workspace_brain_read': return this.workspaceBrainReadCmd(command);
+      case 'workspace_brain_write': return this.workspaceBrainWriteCmd(command);
+      case 'workspace_brain_load_state': return this.workspaceBrainLoadStateCmd(command);
+      case 'workspace_brain_save_state': return this.workspaceBrainSaveStateCmd(command);
+      case 'workspace_brain_get_thread': return this.workspaceBrainGetThreadCmd(command);
+      case 'workspace_brain_upsert_thread': return this.workspaceBrainUpsertThreadCmd(command);
       case 'list_files': return this.listFiles(command);
       case 'list_directories': return this.listDir(command);
       case 'stat': return this.statFile(command);
@@ -335,6 +338,9 @@ export class LucenaAgent {
 
   async readFileCmd({ messageId, path: filePath }) {
     const fullPath = getJailedPath(this.cwd, filePath);
+    if (this._isIgnoredPath(fullPath)) {
+      return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
+    }
     try {
       const content = await readFile(fullPath, 'utf-8');
       this.pushResponse(messageId, 'output', content);
@@ -346,6 +352,9 @@ export class LucenaAgent {
 
   async writeFileCmd({ messageId, path: filePath, content }) {
     const fullPath = getJailedPath(this.cwd, filePath);
+    if (this._isIgnoredPath(fullPath)) {
+      return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
+    }
     const relPath = toBrowserPath(relative(this.cwd, fullPath));
     try {
       await mkdir(dirname(fullPath), { recursive: true });
@@ -356,12 +365,85 @@ export class LucenaAgent {
     }
   }
 
+  async workspaceBrainReadCmd({ messageId, path: filePath }) {
+    const normalized = this._normalizeWorkspaceBrainPath(filePath);
+    if (!normalized) return this.pushResponse(messageId, 'error', 'WorkspaceBrain path is required');
+    const fullPath = getJailedPath(this.cwd, normalized);
+    try {
+      const content = await readFile(fullPath, 'utf-8');
+      this.pushResponse(messageId, 'output', content);
+      this.pushResponse(messageId, 'done', '');
+    } catch (err) {
+      if (err?.code === 'ENOENT') return this.pushResponse(messageId, 'done', '');
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceBrainWriteCmd({ messageId, path: filePath, content }) {
+    const normalized = this._normalizeWorkspaceBrainPath(filePath);
+    if (!normalized) return this.pushResponse(messageId, 'error', 'WorkspaceBrain path is required');
+    const fullPath = getJailedPath(this.cwd, normalized);
+    try {
+      await mkdir(dirname(fullPath), { recursive: true });
+      await writeFile(fullPath, String(content ?? ''), 'utf-8');
+      this.pushResponse(messageId, 'done', `Wrote ${normalized}`);
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceBrainLoadStateCmd({ messageId }) {
+    try {
+      this.pushResponse(messageId, 'output', JSON.stringify(await loadWorkspaceBrainState(this.cwd)));
+      this.pushResponse(messageId, 'done', '');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceBrainSaveStateCmd({ messageId, threads = [], tabThreadMap = {}, project = null }) {
+    try {
+      await saveWorkspaceBrainState(this.cwd, { threads, tabThreadMap, project });
+      this.pushResponse(messageId, 'done', 'WorkspaceBrain SQLite state saved');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceBrainGetThreadCmd({ messageId, threadId = '' }) {
+    try {
+      this.pushResponse(messageId, 'output', JSON.stringify(await getWorkspaceBrainThread(this.cwd, threadId)));
+      this.pushResponse(messageId, 'done', '');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceBrainUpsertThreadCmd({ messageId, thread }) {
+    try {
+      await upsertWorkspaceBrainThread(this.cwd, thread);
+      this.pushResponse(messageId, 'done', 'WorkspaceBrain SQLite thread saved');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  _normalizeWorkspaceBrainPath(filePath) {
+    const normalized = String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!normalized.startsWith('.WorkspaceBrain/')) return '';
+    if (normalized.split('/').includes('..')) return '';
+    return `/${normalized}`;
+  }
+
   async listDir({ messageId, path: dirPath }) {
     const fullPath = getJailedPath(this.cwd, dirPath || '.');
+    if (this._isIgnoredPath(fullPath)) {
+      return this.pushResponse(messageId, 'done', '(empty)');
+    }
     try {
       const entries = await readdir(fullPath, { withFileTypes: true });
       const listing = entries
-        .filter(e => !IGNORED_PATTERNS.includes(e.name))
+        .filter(e => !this.ignore.ignoresPath(relative(this.cwd, join(fullPath, e.name))))
         .map(e => `${e.isDirectory() ? 'dir' : 'file'}\t${e.name}`)
         .join('\n');
       this.pushResponse(messageId, 'done', listing || '(empty)');
@@ -384,9 +466,8 @@ export class LucenaAgent {
     const files = [];
 
     for (const entry of entries) {
-      if (IGNORED_PATTERNS.includes(entry.name)) continue;
-
       const relPath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+      if (this.ignore.ignoresPath(relPath)) continue;
       const fullPath = join(dirPath, entry.name);
 
       if (entry.isDirectory()) {
@@ -404,6 +485,9 @@ export class LucenaAgent {
 
   async statFile({ messageId, path: filePath }) {
     const fullPath = getJailedPath(this.cwd, filePath);
+    if (this._isIgnoredPath(fullPath)) {
+      return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
+    }
     try {
       const s = await stat(fullPath);
       this.pushResponse(messageId, 'done', JSON.stringify({
@@ -420,6 +504,9 @@ export class LucenaAgent {
 
   async deleteFile({ messageId, path: filePath }) {
     const fullPath = getJailedPath(this.cwd, filePath);
+    if (this._isIgnoredPath(fullPath)) {
+      return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
+    }
     const relPath = toBrowserPath(relative(this.cwd, fullPath));
     try {
       if ((await stat(fullPath)).isDirectory()) {
@@ -435,6 +522,9 @@ export class LucenaAgent {
 
   async mkdirCmd({ messageId, path: dirPath }) {
     const fullPath = getJailedPath(this.cwd, dirPath);
+    if (this._isIgnoredPath(fullPath)) {
+      return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
+    }
     const relPath = toBrowserPath(relative(this.cwd, fullPath));
     try {
       await mkdir(fullPath, { recursive: true });
@@ -446,6 +536,9 @@ export class LucenaAgent {
 
   async searchCodebase({ messageId, query, directory }) {
     const searchDir = getJailedPath(this.cwd, directory || '.');
+    if (this.ignore.ignoresPath(relative(this.cwd, searchDir))) {
+      return this.pushResponse(messageId, 'done', 'No matches found');
+    }
     try {
       const child = this._createSearchProcess(query, searchDir);
 
@@ -489,7 +582,7 @@ export class LucenaAgent {
 
   startWatcher() {
     this.watcher = watch(this.cwd, {
-      ignored: (path) => IGNORED_PATTERNS.some(p => path.includes(p)),
+      ignored: (path) => this.ignore.ignoresPath(path),
       persistent: true,
       ignoreInitial: true
     });

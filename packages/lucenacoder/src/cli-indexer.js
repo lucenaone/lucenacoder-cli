@@ -3,11 +3,12 @@
 // and builds a symbol index that can be pushed to the browser
 // via RTDB when the tunnel connects.
 
-import { readFile, readdir } from 'fs/promises';
+import { readFile, readdir, stat } from 'fs/promises';
 import { join, extname, relative } from 'path';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { createWorkspaceIgnore } from './ignore-rules.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -23,12 +24,6 @@ const LANGUAGE_MAP = {
   '.go': 'go',
   '.rs': 'rust',
 };
-
-const IGNORED_PATTERNS = [
-  'node_modules', '.git', '.next', '.wrangler', '.DS_Store',
-  'dist', 'build', '.cache', '.turbo', '.vercel', '.firebase',
-  '.WorkspaceBrain',
-];
 
 // ── Parser singleton ──
 let _Parser = null;
@@ -286,27 +281,45 @@ function extractNestedNames(node, chunks, parentName) {
 
 // ── File Tree Walker ──
 
-async function walkDirectory(dirPath, cwd, results = []) {
+async function walkWorkspaceFiles(dirPath, cwd, workspaceIgnore, results = []) {
   const entries = await readdir(dirPath, { withFileTypes: true });
 
   for (const entry of entries) {
-    if (IGNORED_PATTERNS.some(p => entry.name.includes(p))) continue;
-
     const fullPath = join(dirPath, entry.name);
+    const relPath = relative(cwd, fullPath).replace(/\\/g, '/');
+    if (workspaceIgnore.ignoresPath(relPath)) continue;
+
     if (entry.isDirectory()) {
-      await walkDirectory(fullPath, cwd, results);
+      await walkWorkspaceFiles(fullPath, cwd, workspaceIgnore, results);
     } else if (entry.isFile()) {
-      const ext = extname(entry.name);
-      if (LANGUAGE_MAP[ext]) {
-        results.push({
-          filePath: '/' + relative(cwd, fullPath),
-          fullPath,
-          ext,
-        });
-      }
+      results.push({
+        path: relPath,
+        fullPath,
+        ext: extname(entry.name),
+        lineCount: await countTextFileLines(fullPath),
+      });
     }
   }
+
   return results;
+}
+
+async function countTextFileLines(fullPath) {
+  if (!isTextLikeFile(fullPath)) return null;
+
+  try {
+    const info = await stat(fullPath);
+    if (info.size > 5 * 1024 * 1024) return null;
+    const content = await readFile(fullPath, 'utf-8');
+    if (!content) return 0;
+    return content.split('\n').length;
+  } catch {
+    return null;
+  }
+}
+
+function isTextLikeFile(filePath) {
+  return /\.(cjs|css|csv|go|html?|js|jsx|json|mdx?|mjs|py|rb|rs|sql|svg|ts|tsx|txt|xml|ya?ml)$/i.test(filePath);
 }
 
 // ── Main Index Builder ──
@@ -314,7 +327,15 @@ async function walkDirectory(dirPath, cwd, results = []) {
 export async function buildIndex(cwd, onProgress) {
   await initParser();
 
-  const files = await walkDirectory(cwd, cwd);
+  const workspaceIgnore = createWorkspaceIgnore(cwd);
+  const workspaceFiles = await walkWorkspaceFiles(cwd, cwd, workspaceIgnore);
+  const files = workspaceFiles
+    .filter(file => LANGUAGE_MAP[file.ext])
+    .map(file => ({
+      filePath: '/' + file.path,
+      fullPath: file.fullPath,
+      ext: file.ext,
+    }));
   const totalFiles = files.length;
 
   if (onProgress) onProgress({ phase: 'parsing', current: 0, total: totalFiles });
@@ -362,8 +383,10 @@ export async function buildIndex(cwd, onProgress) {
   if (onProgress) onProgress({ phase: 'done', current: parsed, total: totalFiles });
 
   return {
+    files: workspaceFiles.map(({ path, lineCount }) => ({ path, lineCount })),
     symbols: symbolEntries,
     stats: {
+      fileCount: workspaceFiles.length,
       filesParsed: parsed,
       filesErrored: errors,
       symbolCount: symbolEntries.length,
@@ -375,6 +398,9 @@ export async function buildIndex(cwd, onProgress) {
 
 export async function reindexFile(cwd, relPath) {
   await initParser();
+
+  const workspaceIgnore = createWorkspaceIgnore(cwd);
+  if (workspaceIgnore.ignoresPath(relPath)) return null;
 
   const ext = extname(relPath);
   const langName = LANGUAGE_MAP[ext];
