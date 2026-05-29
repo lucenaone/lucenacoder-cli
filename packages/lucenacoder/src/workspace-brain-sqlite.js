@@ -1,6 +1,6 @@
 import initSqlJs from 'sql.js';
 import { createRequire } from 'module';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 
@@ -8,6 +8,8 @@ const require = createRequire(import.meta.url);
 const sqliteWasmPath = require.resolve('sql.js/dist/sql-wasm.wasm');
 
 let sqlPromise = null;
+let writeQueue = Promise.resolve();
+const SQLITE_HEADER = 'SQLite format 3\u0000';
 
 function getSql() {
   if (!sqlPromise) {
@@ -17,12 +19,14 @@ function getSql() {
 }
 
 export async function ensureWorkspaceBrainSqlite(cwd) {
-  const db = await openWorkspaceBrainDb(cwd);
-  try {
-    await saveWorkspaceBrainDb(cwd, db);
-  } finally {
-    db.close();
-  }
+  return enqueueWorkspaceBrainWrite(async () => {
+    const db = await openWorkspaceBrainDb(cwd, { waitForWrites: false });
+    try {
+      await saveWorkspaceBrainDb(cwd, db);
+    } finally {
+      db.close();
+    }
+  });
 }
 
 export async function loadWorkspaceBrainState(cwd) {
@@ -39,15 +43,17 @@ export async function loadWorkspaceBrainState(cwd) {
 }
 
 export async function saveWorkspaceBrainState(cwd, { threads = [], tabThreadMap = {}, project = null } = {}) {
-  const db = await openWorkspaceBrainDb(cwd);
-  try {
-    writeThreads(db, threads);
-    writeTabThreadMap(db, tabThreadMap, threads);
-    if (project) writeMetaJson(db, 'workspace', project);
-    await saveWorkspaceBrainDb(cwd, db);
-  } finally {
-    db.close();
-  }
+  return enqueueWorkspaceBrainWrite(async () => {
+    const db = await openWorkspaceBrainDb(cwd, { waitForWrites: false });
+    try {
+      writeThreads(db, threads);
+      writeTabThreadMap(db, tabThreadMap, threads);
+      if (project) writeMetaJson(db, 'workspace', project);
+      await saveWorkspaceBrainDb(cwd, db);
+    } finally {
+      db.close();
+    }
+  });
 }
 
 export async function getWorkspaceBrainThread(cwd, requestedThreadId = '') {
@@ -73,26 +79,89 @@ export async function upsertWorkspaceBrainThread(cwd, thread) {
   });
 }
 
-async function openWorkspaceBrainDb(cwd) {
+async function openWorkspaceBrainDb(cwd, { waitForWrites = true } = {}) {
+  if (waitForWrites) await writeQueue;
   const SQL = await getSql();
   const dbPath = workspaceBrainDbPath(cwd);
-  let bytes = null;
-  if (existsSync(dbPath)) {
-    bytes = new Uint8Array(await readFile(dbPath));
-  }
-  const db = bytes?.length ? new SQL.Database(bytes) : new SQL.Database();
-  ensureSchema(db);
-  return db;
+  const bytes = existsSync(dbPath) ? new Uint8Array(await readFile(dbPath)) : null;
+  return bytes?.length
+    ? await openVerifiedDatabase(SQL, cwd, bytes)
+    : createUsableDatabase(SQL);
 }
 
 async function saveWorkspaceBrainDb(cwd, db) {
   const dbPath = workspaceBrainDbPath(cwd);
+  const backupPath = workspaceBrainBackupPath(cwd);
+  const bytes = Buffer.from(db.export());
+  verifySqliteBytes(bytes);
   await mkdir(dirname(dbPath), { recursive: true });
-  await writeFile(dbPath, Buffer.from(db.export()));
+  await atomicWriteFile(backupPath, bytes);
+  await atomicWriteFile(dbPath, bytes);
+}
+
+async function enqueueWorkspaceBrainWrite(operation) {
+  const run = writeQueue.then(operation, operation);
+  writeQueue = run.catch(() => {});
+  return run;
+}
+
+async function atomicWriteFile(filePath, bytes) {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, bytes);
+  await rename(tempPath, filePath);
+}
+
+async function openVerifiedDatabase(SQL, cwd, primaryBytes) {
+  try {
+    return createUsableDatabase(SQL, primaryBytes);
+  } catch {
+    const backupPath = workspaceBrainBackupPath(cwd);
+    if (existsSync(backupPath)) {
+      try {
+        const backupBytes = new Uint8Array(await readFile(backupPath));
+        return createUsableDatabase(SQL, backupBytes);
+      } catch {
+        return createUsableDatabase(SQL);
+      }
+    }
+    return createUsableDatabase(SQL);
+  }
+}
+
+function createUsableDatabase(SQL, bytes = null) {
+  const db = bytes?.length ? new SQL.Database(bytes) : new SQL.Database();
+  try {
+    ensureSchema(db);
+    verifyDatabaseIntegrity(db);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function verifyDatabaseIntegrity(db) {
+  const rows = selectRows(db, 'PRAGMA integrity_check');
+  if (rows[0]?.integrity_check !== 'ok') {
+    throw new Error('WorkspaceBrain SQLite integrity check failed');
+  }
+}
+
+function verifySqliteBytes(bytes) {
+  if (!bytes?.length || bytes.length < 100) {
+    throw new Error('WorkspaceBrain SQLite export is invalid');
+  }
+  if (bytes.subarray(0, 16).toString('utf8') !== SQLITE_HEADER) {
+    throw new Error('WorkspaceBrain SQLite export is not a SQLite database');
+  }
 }
 
 function workspaceBrainDbPath(cwd) {
   return join(cwd, '.WorkspaceBrain', 'workspace.sqlite');
+}
+
+function workspaceBrainBackupPath(cwd) {
+  return `${workspaceBrainDbPath(cwd)}.bak`;
 }
 
 function ensureSchema(db) {

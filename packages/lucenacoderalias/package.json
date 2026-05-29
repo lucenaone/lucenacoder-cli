@@ -1,9 +1,9 @@
 {
   "name": "lucenacoder",
-  "version": "1.2.9",
+  "version": "1.2.12",
   "description": "Loads the LucenaCoder Tunnel via @lucenaone/coder",
   "dependencies": {
-    "@lucenaone/coder": "1.2.9"
+    "@lucenaone/coder": "1.2.12"
   },
   "bin": {
     "lucenacoder": "./node_modules/@lucenaone/coder/bin/lucena.js"
