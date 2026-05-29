@@ -19,6 +19,19 @@ import {
 } from './workspace-brain-sqlite.js';
 
 const SEARCH_GLOB = '*.{js,jsx,ts,tsx,json,md,css,html,py,rb,go,rs,dart}';
+const SEARCH_EXCLUDE_GLOBS = [
+  '!**/.git/**',
+  '!**/node_modules/**',
+  '!**/dist/**',
+  '!**/build/**',
+  '!**/coverage/**',
+  '!**/.DS_Store',
+  '!**/.WorkspaceBrain/workspace.*',
+  '!**/.WorkspaceBrain/threads/**',
+  '!**/.WorkspaceBrain/memories/**',
+  '!**/.WorkspaceBrain/context/**',
+];
+const SEARCH_SKILLS_GLOB = '.WorkspaceBrain/skills/**';
 const TUNNEL_HEARTBEAT_INTERVAL_MS = 15_000;
 const REMOTE_STATUS_INTERVAL_MS = 15_000;
 
@@ -242,7 +255,7 @@ export class LucenaAgent {
     switch (type) {
       case 'execute': return this.executeCommand(command);
       case 'read_files': return this.readFileCmd(command);
-      case 'write_file': return this.writeFileCmd(command);
+      case 'file_put': return this.putFileCmd(command);
       case 'workspace_brain_read': return this.workspaceBrainReadCmd(command);
       case 'workspace_brain_write': return this.workspaceBrainWriteCmd(command);
       case 'workspace_brain_load_state': return this.workspaceBrainLoadStateCmd(command);
@@ -350,15 +363,34 @@ export class LucenaAgent {
     }
   }
 
-  async writeFileCmd({ messageId, path: filePath, content }) {
+  async putFileCmd({ messageId, path: filePath, content, source }) {
     const fullPath = getJailedPath(this.cwd, filePath);
     if (this._isIgnoredPath(fullPath)) {
       return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
     }
     const relPath = toBrowserPath(relative(this.cwd, fullPath));
     try {
+      let existed = true;
+      let originalContent = '';
+      try {
+        originalContent = await readFile(fullPath, 'utf-8');
+      } catch {
+        existed = false;
+      }
       await mkdir(dirname(fullPath), { recursive: true });
-      await writeFile(fullPath, content, 'utf-8');
+      const nextContent = String(content ?? '');
+      await writeFile(fullPath, nextContent, 'utf-8');
+      if (source) {
+        const changesRef = ref(this.db, `tunnels/${this.tunnelId}/fileChanges`);
+        push(changesRef, {
+          event: existed ? 'change' : 'add',
+          path: relPath,
+          source,
+          originalContent,
+          content: nextContent,
+          timestamp: serverTimestamp()
+        }).catch(() => {});
+      }
       this.pushResponse(messageId, 'done', `Wrote ${relPath}`);
     } catch (err) {
       this.pushResponse(messageId, 'error', this._sanitize(err.message));
@@ -444,7 +476,7 @@ export class LucenaAgent {
       const entries = await readdir(fullPath, { withFileTypes: true });
       const listing = entries
         .filter(e => !this.ignore.ignoresPath(relative(this.cwd, join(fullPath, e.name))))
-        .map(e => `${e.isDirectory() ? 'dir' : 'file'}\t${e.name}`)
+        .map(e => `${e.isDirectory() ? 'dir' : 'file'}: ${e.name}`)
         .join('\n');
       this.pushResponse(messageId, 'done', listing || '(empty)');
     } catch (err) {
@@ -561,7 +593,16 @@ export class LucenaAgent {
     try {
       const rg = spawnSync('rg', ['--version'], { cwd: this.cwd, encoding: 'utf8' });
       if (rg.status === 0) {
-        return spawn('rg', ['-n', '--glob', SEARCH_GLOB, query, searchDir], { cwd: this.cwd });
+        return spawn('rg', [
+          '-n',
+          '--hidden',
+          '--no-ignore',
+          '--glob', SEARCH_GLOB,
+          ...SEARCH_EXCLUDE_GLOBS.flatMap((glob) => ['--glob', glob]),
+          '--glob', SEARCH_SKILLS_GLOB,
+          query,
+          searchDir,
+        ], { cwd: this.cwd });
       }
     } catch {
       // Fall back to the OS-native search tool below.

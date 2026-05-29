@@ -203,47 +203,51 @@ function ensureSchema(db) {
       thread_id TEXT NOT NULL
     );
   `);
-  ensureTimelineItemsSchema(db);
+  ensureRawEventsSchema(db);
 }
 
-function ensureTimelineItemsSchema(db) {
-  const columns = selectRows(db, 'PRAGMA table_info(timeline_items)');
-  const hasStorageId = columns.some((column) => column.name === 'storage_id');
-
-  if (columns.length && !hasStorageId) {
-    db.run('ALTER TABLE timeline_items RENAME TO timeline_items_legacy');
-    createTimelineItemsTable(db);
-    db.run(`
-      INSERT INTO timeline_items (storage_id, id, turn_id, item_index, type, content, name, args_json, status, result, error, observation_json, metadata_json, created_at)
-      SELECT turn_id || ':' || item_index, id, turn_id, item_index, type, content, name, args_json, status, result, error, observation_json, metadata_json, created_at
-      FROM timeline_items_legacy
-    `);
-    db.run('DROP TABLE timeline_items_legacy');
-    return;
-  }
-
-  createTimelineItemsTable(db);
-}
-
-function createTimelineItemsTable(db) {
+function ensureRawEventsSchema(db) {
   db.run(`
-    CREATE TABLE IF NOT EXISTS timeline_items (
+    CREATE TABLE IF NOT EXISTS raw_events (
       storage_id TEXT PRIMARY KEY,
       id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
       turn_id TEXT NOT NULL,
-      item_index INTEGER NOT NULL,
+      event_index INTEGER NOT NULL,
       type TEXT NOT NULL,
-      content TEXT,
+      role TEXT,
+      tool_call_id TEXT,
       name TEXT,
-      args_json TEXT,
       status TEXT,
+      content TEXT,
+      args_json TEXT,
       result TEXT,
       error TEXT,
       observation_json TEXT,
       metadata_json TEXT,
+      images_json TEXT,
       created_at TEXT
     );
-    CREATE INDEX IF NOT EXISTS idx_timeline_turn_order ON timeline_items(turn_id, item_index);
+    CREATE INDEX IF NOT EXISTS idx_raw_events_turn_order ON raw_events(turn_id, event_index);
+    CREATE INDEX IF NOT EXISTS idx_raw_events_tool_call ON raw_events(turn_id, tool_call_id);
+    CREATE TABLE IF NOT EXISTS model_call_traces (
+      storage_id TEXT PRIMARY KEY,
+      turn_id TEXT NOT NULL,
+      trace_index INTEGER NOT NULL,
+      iteration INTEGER,
+      model TEXT,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_tokens INTEGER NOT NULL DEFAULT 0,
+      message_count INTEGER NOT NULL DEFAULT 0,
+      assistant_chars INTEGER NOT NULL DEFAULT 0,
+      had_tool_calls INTEGER NOT NULL DEFAULT 0,
+      available_tools_json TEXT NOT NULL DEFAULT '[]',
+      tool_calls_json TEXT NOT NULL DEFAULT '[]',
+      trace_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_call_traces_turn_order ON model_call_traces(turn_id, trace_index);
   `);
 }
 
@@ -268,34 +272,78 @@ function readThreads(db) {
 
 function readTurns(db, threadId) {
   return selectRows(db, 'SELECT * FROM turns WHERE thread_id = ? ORDER BY turn_index ASC', [threadId])
-    .map((row) => cleanObject({
-      id: row.id,
-      userMessage: parseJson(row.user_message_json, null),
-      timeline: readTimeline(db, row.id),
-      startedAt: row.started_at || null,
-      completedAt: row.completed_at || null,
-      tokenUsage: parseJson(row.token_usage_json, { prompt: 0, completion: 0, total: 0 }),
-      toolCount: Number(row.tool_count || 0),
-      model: row.model || null,
-      metadata: parseJson(row.metadata_json, null),
-      remoteTunnelRunId: row.remote_tunnel_run_id || null,
-      cloudRunId: row.cloud_run_id || null,
-    }));
+    .map((row) => {
+      const rawEvents = readRawEvents(db, row.id);
+      return cleanObject({
+        id: row.id,
+        userMessage: parseJson(row.user_message_json, null),
+        rawEvents,
+        timeline: timelineFromRawEvents(rawEvents),
+        startedAt: row.started_at || null,
+        completedAt: row.completed_at || null,
+        tokenUsage: parseJson(row.token_usage_json, { prompt: 0, completion: 0, total: 0 }),
+        toolCount: Number(row.tool_count || 0),
+        model: row.model || null,
+        ...turnMetadataFromSql(row.metadata_json),
+        modelCallTraces: readModelCallTraces(db, row.id),
+        remoteTunnelRunId: row.remote_tunnel_run_id || null,
+        cloudRunId: row.cloud_run_id || null,
+      });
+    });
 }
 
-function readTimeline(db, turnId) {
-  return selectRows(db, 'SELECT * FROM timeline_items WHERE turn_id = ? ORDER BY item_index ASC', [turnId])
+function readModelCallTraces(db, turnId) {
+  return selectRows(db, 'SELECT * FROM model_call_traces WHERE turn_id = ? ORDER BY trace_index ASC', [turnId])
+    .map((row) => {
+      const trace = parseJson(row.trace_json, {});
+      return {
+        ...trace,
+        iteration: Number(row.iteration || 0) || undefined,
+        availableTools: parseJson(row.available_tools_json, []),
+        messageCount: Number(row.message_count || 0),
+        response: {
+          ...(trace.response || {}),
+          model: row.model || trace.response?.model,
+          usage: {
+            prompt_tokens: Number(row.prompt_tokens || 0),
+            completion_tokens: Number(row.completion_tokens || 0),
+            total_tokens: Number(row.total_tokens || 0),
+            cached_tokens: Number(row.cached_tokens || 0),
+          },
+          assistantChars: Number(row.assistant_chars || 0),
+          hadToolCalls: Boolean(row.had_tool_calls),
+        },
+        toolCalls: parseJson(row.tool_calls_json, []),
+      };
+    });
+}
+
+function turnMetadataFromSql(rawMetadata) {
+  const metadata = parseJson(rawMetadata, null);
+  if (!metadata || typeof metadata !== 'object') return { metadata: null };
+  const { modelCallTraces, ...rest } = metadata;
+  return {
+    metadata: Object.keys(rest).length ? rest : null,
+    modelCallTraces: Array.isArray(modelCallTraces) ? modelCallTraces : [],
+  };
+}
+
+function readRawEvents(db, turnId) {
+  return selectRows(db, 'SELECT * FROM raw_events WHERE turn_id = ? ORDER BY event_index ASC', [turnId])
     .map((row) => cleanObject({
       id: row.id,
       type: row.type,
-      content: row.content,
+      role: row.role,
+      toolCallId: row.tool_call_id,
       name: row.name,
-      args: parseJson(row.args_json, null),
       status: row.status,
+      content: row.content,
+      args: parseJson(row.args_json, null),
       result: row.result,
       error: row.error,
       observation: parseJson(row.observation_json, null),
       metadata: parseJson(row.metadata_json, null),
+      images: parseJson(row.images_json, null),
       createdAt: row.created_at || null,
     }));
 }
@@ -303,12 +351,14 @@ function readTimeline(db, turnId) {
 function writeThreads(db, threads) {
   db.run('BEGIN');
   try {
-    db.run('DELETE FROM timeline_items');
+    db.run('DELETE FROM raw_events');
+    db.run('DELETE FROM model_call_traces');
     db.run('DELETE FROM turns');
     db.run('DELETE FROM threads');
     const insertThread = db.prepare('INSERT INTO threads (id, title, summary, tags_json, status, model, active_plan_json, ledger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const insertTurn = db.prepare('INSERT INTO turns (id, thread_id, turn_index, user_message_json, started_at, completed_at, token_usage_json, tool_count, model, metadata_json, remote_tunnel_run_id, cloud_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    const insertItem = db.prepare('INSERT INTO timeline_items (storage_id, id, turn_id, item_index, type, content, name, args_json, status, result, error, observation_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertRawEvent = db.prepare('INSERT INTO raw_events (storage_id, id, thread_id, turn_id, event_index, type, role, tool_call_id, name, status, content, args_json, result, error, observation_json, metadata_json, images_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertModelTrace = db.prepare('INSERT INTO model_call_traces (storage_id, turn_id, trace_index, iteration, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, message_count, assistant_chars, had_tool_calls, available_tools_json, tool_calls_json, trace_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     for (const thread of threads || []) {
       insertThread.run([
         thread.id,
@@ -323,6 +373,7 @@ function writeThreads(db, threads) {
         thread.updatedAt || thread.createdAt || null,
       ]);
       for (const [turnIndex, turn] of (thread.turns || []).entries()) {
+        const rawEvents = rawEventsFromTurn(turn);
         insertTurn.run([
           turn.id,
           thread.id,
@@ -333,38 +384,99 @@ function writeThreads(db, threads) {
           json(turn.tokenUsage || { prompt: 0, completion: 0, total: 0 }),
           Number(turn.toolCount || 0),
           turn.model || null,
-          nullableJson(turn.metadata || null),
+          nullableJson(turnMetadataForSql(turn)),
           turn.remoteTunnelRunId || null,
           turn.cloudRunId || null,
         ]);
-        for (const [itemIndex, item] of (turn.timeline || []).entries()) {
-          insertItem.run([
-            `${turn.id}:${itemIndex}`,
-            item.id || `${turn.id}-item-${itemIndex}`,
+        for (const [eventIndex, event] of rawEvents.entries()) {
+          insertRawEvent.run([
+            `${turn.id}:${eventIndex}`,
+            event.id || `${turn.id}:raw:${eventIndex}`,
+            thread.id,
             turn.id,
-            itemIndex,
-            item.type || 'text',
-            item.content || null,
-            item.name || null,
-            nullableJson(item.args || null),
-            item.status || null,
-            item.result || null,
-            item.error || null,
-            nullableJson(item.observation || null),
-            nullableJson(item.metadata || null),
-            item.createdAt || null,
+            eventIndex,
+            event.type || 'message',
+            event.role || null,
+            event.toolCallId || null,
+            event.name || null,
+            event.status || null,
+            event.content || null,
+            nullableJson(event.args || null),
+            event.result || null,
+            event.error || null,
+            nullableJson(event.observation || null),
+            nullableJson(event.metadata || null),
+            nullableJson(event.images || null),
+            event.createdAt || null,
+          ]);
+        }
+        for (const [traceIndex, trace] of (turn.modelCallTraces || []).entries()) {
+          const usage = trace.response?.usage || {};
+          insertModelTrace.run([
+            `${turn.id}:${traceIndex}`,
+            turn.id,
+            traceIndex,
+            trace.iteration || null,
+            trace.response?.model || turn.model || null,
+            Number(usage.prompt_tokens || 0),
+            Number(usage.completion_tokens || 0),
+            Number(usage.total_tokens || 0),
+            Number(usage.cached_tokens || usage.prompt_tokens_details?.cached_tokens || 0),
+            Number(trace.messageCount || 0),
+            Number(trace.response?.assistantChars || 0),
+            trace.response?.hadToolCalls ? 1 : 0,
+            json(trace.availableTools || []),
+            json(trace.toolCalls || []),
+            json(trace),
           ]);
         }
       }
     }
     insertThread.free();
     insertTurn.free();
-    insertItem.free();
+    insertRawEvent.free();
+    insertModelTrace.free();
     db.run('COMMIT');
   } catch (error) {
     db.run('ROLLBACK');
     throw error;
   }
+}
+
+function turnMetadataForSql(turn = {}) {
+  const metadata = { ...(turn.metadata || {}) };
+  return Object.keys(metadata).length ? metadata : null;
+}
+
+function rawEventsFromTurn(turn = {}) {
+  return Array.isArray(turn.rawEvents) ? turn.rawEvents : [];
+}
+
+function timelineFromRawEvents(rawEvents = []) {
+  const timeline = [];
+  const toolIndexes = new Map();
+  for (const event of rawEvents || []) {
+    if (event?.type === 'message' && event.role === 'assistant') {
+      timeline.push(cleanObject({ id: event.id, type: 'text', content: event.content || '', metadata: event.metadata || null, createdAt: event.createdAt || null }));
+    } else if (event?.type === 'system') {
+      timeline.push(cleanObject({ id: event.id, type: 'system', content: event.content || '', metadata: event.metadata || null, createdAt: event.createdAt || null }));
+    } else if (event?.type === 'tool_call') {
+      const id = event.toolCallId || event.id;
+      toolIndexes.set(id, timeline.length);
+      timeline.push(cleanObject({ id, type: 'tool', name: event.name || '', args: event.args || null, status: event.status || 'running', metadata: event.metadata || null, createdAt: event.createdAt || null }));
+    } else if (event?.type === 'tool_result') {
+      const id = event.toolCallId || event.id;
+      const index = toolIndexes.get(id);
+      const patch = cleanObject({ id, type: 'tool', name: event.name || '', status: event.status || (event.error ? 'error' : 'done'), result: event.result, error: event.error, observation: event.observation || null, metadata: event.metadata || null });
+      if (index == null) {
+        toolIndexes.set(id, timeline.length);
+        timeline.push({ ...patch, createdAt: event.createdAt || null });
+      } else {
+        timeline[index] = { ...timeline[index], ...patch };
+      }
+    }
+  }
+  return timeline.filter((item) => item.type !== 'text' || item.content);
 }
 
 function readTabThreadMap(db) {
@@ -418,8 +530,12 @@ function threadIndexEntry(thread = {}) {
 function countThreadMessages(thread = {}) {
   let count = 0;
   for (const turn of thread.turns || []) {
-    if (turn.userMessage?.content) count += 1;
-    count += (turn.timeline || []).filter((item) => item.type === 'text').length;
+    const rawEvents = rawEventsFromTurn(turn);
+    count += rawEvents.filter((event) => (
+      event?.type === 'message'
+      && (event.role === 'user' || event.role === 'assistant')
+      && event.content
+    )).length;
   }
   return count;
 }
