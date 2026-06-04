@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'child_process';
 import { watch } from 'chokidar';
 import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'fs/promises';
 import { join, resolve, dirname, basename, relative, isAbsolute, extname } from 'path';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { FIREBASE_CONFIG } from './config.js';
 import { buildIndex, reindexFile } from './cli-indexer.js';
 import { LucenaShell } from './lucena-shell.js';
@@ -112,10 +112,22 @@ export class LucenaAgent {
         const subPath = join(brainDir, sub);
         if (!existsSync(subPath)) mkdirSync(subPath, { recursive: true });
       }
+      this._ensureWorkspaceBrainGitignore();
     } catch (err) {
       // Non-fatal — the brain is best-effort
       console.warn('[workspace-brain] scaffold failed:', err.message);
     }
+  }
+
+  _ensureWorkspaceBrainGitignore() {
+    const gitignorePath = join(this.cwd, '.gitignore');
+    const existing = existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf8') : '';
+    const lines = existing.split(/\r?\n/).map((line) => line.trim());
+    if (lines.includes('.WorkspaceBrain') || lines.includes('.WorkspaceBrain/')) return;
+    const nextContent = existing
+      ? `${existing}${existing.endsWith('\n') ? '' : '\n'}.WorkspaceBrain\n`
+      : '.WorkspaceBrain\n';
+    writeFileSync(gitignorePath, nextContent);
   }
 
   async start() {
@@ -262,6 +274,8 @@ export class LucenaAgent {
       case 'workspace_brain_save_state': return this.workspaceBrainSaveStateCmd(command);
       case 'workspace_brain_get_thread': return this.workspaceBrainGetThreadCmd(command);
       case 'workspace_brain_upsert_thread': return this.workspaceBrainUpsertThreadCmd(command);
+      case 'workspace_env_set': return this.workspaceEnvSetCmd(command);
+      case 'workspace_env_has': return this.workspaceEnvHasCmd(command);
       case 'list_files': return this.listFiles(command);
       case 'list_directories': return this.listDir(command);
       case 'stat': return this.statFile(command);
@@ -305,20 +319,19 @@ export class LucenaAgent {
     this.pushResponse(messageId, 'done', 'PRO token stored');
   }
 
-  pushResponse(messageId, type, text, extra = {}) {
+  async pushResponse(messageId, type, text, extra = {}) {
     const responsesRef = ref(this.db, `tunnels/${this.tunnelId}/responses`);
     const clientId = this.commandClients.get(messageId) || null;
     const responseRef = push(responsesRef);
-    set(responseRef, {
+    await set(responseRef, {
       messageId,
       clientId,
       type,
       text,
       timestamp: serverTimestamp(),
       ...extra
-    }).finally(() => {
-      if (['done', 'error', 'pong'].includes(type)) this.commandClients.delete(messageId);
     });
+    if (['done', 'error', 'pong'].includes(type)) this.commandClients.delete(messageId);
   }
 
   async executeCommand({ messageId, command, mode = 'safe', approved = false, outsideWorkspaceApproved = false }) {
@@ -356,10 +369,10 @@ export class LucenaAgent {
     }
     try {
       const content = await readFile(fullPath, 'utf-8');
-      this.pushResponse(messageId, 'output', content);
-      this.pushResponse(messageId, 'done', '');
+      await this.pushResponse(messageId, 'output', content);
+      await this.pushResponse(messageId, 'done', '');
     } catch (err) {
-      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+      await this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }
   }
 
@@ -380,20 +393,28 @@ export class LucenaAgent {
       await mkdir(dirname(fullPath), { recursive: true });
       const nextContent = String(content ?? '');
       await writeFile(fullPath, nextContent, 'utf-8');
+      const confirmedContent = await readFile(fullPath, 'utf-8');
+      if (confirmedContent !== nextContent) {
+        throw new Error(`Write verification failed for ${relPath}`);
+      }
       if (source) {
         const changesRef = ref(this.db, `tunnels/${this.tunnelId}/fileChanges`);
-        push(changesRef, {
-          event: existed ? 'change' : 'add',
-          path: relPath,
-          source,
-          originalContent,
-          content: nextContent,
-          timestamp: serverTimestamp()
-        }).catch(() => {});
+        try {
+          await push(changesRef, {
+            event: existed ? 'change' : 'add',
+            path: relPath,
+            source,
+            originalContent,
+            content: nextContent,
+            timestamp: serverTimestamp()
+          });
+        } catch (err) {
+          console.warn(`Failed to publish file change event for ${relPath}:`, err?.message || err);
+        }
       }
-      this.pushResponse(messageId, 'done', `Wrote ${relPath}`);
+      await this.pushResponse(messageId, 'done', `Wrote ${relPath}`);
     } catch (err) {
-      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+      await this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }
   }
 
@@ -455,6 +476,25 @@ export class LucenaAgent {
     try {
       await upsertWorkspaceBrainThread(this.cwd, thread);
       this.pushResponse(messageId, 'done', 'WorkspaceBrain SQLite thread saved');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceEnvSetCmd({ messageId, envKey, value }) {
+    try {
+      if (!this.shell.setWorkspaceEnv(envKey, value)) {
+        return this.pushResponse(messageId, 'error', 'envKey is required');
+      }
+      this.pushResponse(messageId, 'done', `Workspace credential stored as ${String(envKey || '').toUpperCase().replace(/[^A-Z0-9_]+/g, '_')}`);
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceEnvHasCmd({ messageId, envKey }) {
+    try {
+      this.pushResponse(messageId, 'done', this.shell.hasWorkspaceEnv(envKey) ? 'true' : 'false');
     } catch (err) {
       this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }

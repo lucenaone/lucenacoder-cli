@@ -36,6 +36,19 @@ export class LucenaShell {
   constructor(workspaceRoot) {
     this.workspaceRoot = resolve(workspaceRoot);
     this.cwd = this.workspaceRoot;
+    this.workspaceEnv = {};
+  }
+
+  setWorkspaceEnv(envKey, value) {
+    const cleanKey = String(envKey || '').toUpperCase().replace(/[^A-Z0-9_]+/g, '_');
+    if (!cleanKey) return false;
+    this.workspaceEnv[cleanKey] = String(value || '').trim();
+    return true;
+  }
+
+  hasWorkspaceEnv(envKey) {
+    const cleanKey = String(envKey || '').toUpperCase().replace(/[^A-Z0-9_]+/g, '_');
+    return Boolean(cleanKey && this.workspaceEnv[cleanKey]);
   }
 
   analyze(rawCommand) {
@@ -158,6 +171,7 @@ export class LucenaShell {
       preferLocal: true,
       stdin: 'pipe',
       env: {
+        ...this.workspaceEnv,
         LUCENA_WORKSPACE_ROOT: this.workspaceRoot,
       },
     });

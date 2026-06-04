@@ -309,6 +309,7 @@ function readModelCallTraces(db, turnId) {
             completion_tokens: Number(row.completion_tokens || 0),
             total_tokens: Number(row.total_tokens || 0),
             cached_tokens: Number(row.cached_tokens || 0),
+            fresh_prompt_tokens: Math.max(0, Number(row.prompt_tokens || 0) - Number(row.cached_tokens || 0)),
           },
           assistantChars: Number(row.assistant_chars || 0),
           hadToolCalls: Boolean(row.had_tool_calls),
@@ -351,15 +352,14 @@ function readRawEvents(db, turnId) {
 function writeThreads(db, threads) {
   db.run('BEGIN');
   try {
-    db.run('DELETE FROM raw_events');
-    db.run('DELETE FROM model_call_traces');
-    db.run('DELETE FROM turns');
-    db.run('DELETE FROM threads');
-    const insertThread = db.prepare('INSERT INTO threads (id, title, summary, tags_json, status, model, active_plan_json, ledger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    const insertTurn = db.prepare('INSERT INTO turns (id, thread_id, turn_index, user_message_json, started_at, completed_at, token_usage_json, tool_count, model, metadata_json, remote_tunnel_run_id, cloud_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const nextThreads = threads || [];
+    pruneMissingThreads(db, nextThreads);
+
+    const insertThread = db.prepare('INSERT OR REPLACE INTO threads (id, title, summary, tags_json, status, model, active_plan_json, ledger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertTurn = db.prepare('INSERT OR REPLACE INTO turns (id, thread_id, turn_index, user_message_json, started_at, completed_at, token_usage_json, tool_count, model, metadata_json, remote_tunnel_run_id, cloud_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const insertRawEvent = db.prepare('INSERT INTO raw_events (storage_id, id, thread_id, turn_id, event_index, type, role, tool_call_id, name, status, content, args_json, result, error, observation_json, metadata_json, images_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const insertModelTrace = db.prepare('INSERT INTO model_call_traces (storage_id, turn_id, trace_index, iteration, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, message_count, assistant_chars, had_tool_calls, available_tools_json, tool_calls_json, trace_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    for (const thread of threads || []) {
+    for (const thread of nextThreads) {
       insertThread.run([
         thread.id,
         thread.title || 'New Thread',
@@ -372,8 +372,14 @@ function writeThreads(db, threads) {
         thread.createdAt || null,
         thread.updatedAt || thread.createdAt || null,
       ]);
-      for (const [turnIndex, turn] of (thread.turns || []).entries()) {
+
+      const turns = thread.turns || [];
+      pruneMissingTurns(db, thread.id, turns);
+
+      for (const [turnIndex, turn] of turns.entries()) {
         const rawEvents = rawEventsFromTurn(turn);
+        db.run('DELETE FROM raw_events WHERE turn_id = ?', [turn.id]);
+        db.run('DELETE FROM model_call_traces WHERE turn_id = ?', [turn.id]);
         insertTurn.run([
           turn.id,
           thread.id,
@@ -441,6 +447,37 @@ function writeThreads(db, threads) {
     db.run('ROLLBACK');
     throw error;
   }
+}
+
+function pruneMissingThreads(db, threads = []) {
+  const ids = threads.map((thread) => thread.id).filter(Boolean);
+  if (ids.length === 0) {
+    db.run('DELETE FROM raw_events');
+    db.run('DELETE FROM model_call_traces');
+    db.run('DELETE FROM turns');
+    db.run('DELETE FROM threads');
+    return;
+  }
+  const placeholders = ids.map(() => '?').join(', ');
+  db.run(`DELETE FROM raw_events WHERE turn_id IN (SELECT id FROM turns WHERE thread_id NOT IN (${placeholders}))`, ids);
+  db.run(`DELETE FROM model_call_traces WHERE turn_id IN (SELECT id FROM turns WHERE thread_id NOT IN (${placeholders}))`, ids);
+  db.run(`DELETE FROM turns WHERE thread_id NOT IN (${placeholders})`, ids);
+  db.run(`DELETE FROM threads WHERE id NOT IN (${placeholders})`, ids);
+}
+
+function pruneMissingTurns(db, threadId, turns = []) {
+  const ids = turns.map((turn) => turn.id).filter(Boolean);
+  if (ids.length === 0) {
+    db.run('DELETE FROM raw_events WHERE turn_id IN (SELECT id FROM turns WHERE thread_id = ?)', [threadId]);
+    db.run('DELETE FROM model_call_traces WHERE turn_id IN (SELECT id FROM turns WHERE thread_id = ?)', [threadId]);
+    db.run('DELETE FROM turns WHERE thread_id = ?', [threadId]);
+    return;
+  }
+  const params = [threadId, ...ids];
+  const placeholders = ids.map(() => '?').join(', ');
+  db.run(`DELETE FROM raw_events WHERE turn_id IN (SELECT id FROM turns WHERE thread_id = ? AND id NOT IN (${placeholders}))`, params);
+  db.run(`DELETE FROM model_call_traces WHERE turn_id IN (SELECT id FROM turns WHERE thread_id = ? AND id NOT IN (${placeholders}))`, params);
+  db.run(`DELETE FROM turns WHERE thread_id = ? AND id NOT IN (${placeholders})`, params);
 }
 
 function turnMetadataForSql(turn = {}) {
