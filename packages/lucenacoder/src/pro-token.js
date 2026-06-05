@@ -5,6 +5,17 @@ import { homedir } from 'os';
 const TOKEN_PATH = join(homedir(), '.lucenacoder', 'pro.json');
 const VALIDATE_URL = process.env.LUCENA_VALIDATE_PRO_URL || 'https://lucenacoder.com/api/pro/validate-token';
 const REGISTER_TUNNEL_URL = process.env.LUCENA_REGISTER_TUNNEL_URL || 'https://lucenacoder.com/api/remote/register-tunnel';
+const PRO_FETCH_TIMEOUT_MS = 4_000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = PRO_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export async function readStoredProToken() {
   try {
@@ -34,7 +45,7 @@ export async function validateStoredProToken() {
   if (!stored?.tokenForPro) return { valid: false };
 
   try {
-    const response = await fetch(VALIDATE_URL, {
+    const response = await fetchWithTimeout(VALIDATE_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tokenForPro: stored.tokenForPro }),
@@ -51,7 +62,7 @@ export async function registerProTunnel({ tokenForPro, tunnelId, cwdName, platfo
   if (!tokenForPro || !tunnelId) return { ok: false };
 
   try {
-    const response = await fetch(REGISTER_TUNNEL_URL, {
+    const response = await fetchWithTimeout(REGISTER_TUNNEL_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

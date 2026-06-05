@@ -74,6 +74,9 @@ export class LucenaShell {
       };
     }
 
+    sanitized.command = normalizeWorkspaceAbsoluteCommandPaths(sanitized.command, this.workspaceRoot);
+    analysis.command = sanitized.command;
+
     if (!sanitized.command) return analysis;
 
     if (/`|\$\(/.test(sanitized.command)) {
@@ -199,7 +202,7 @@ export class LucenaShell {
 
     if (command === 'cd') {
       const target = words[index + 1] ? stripQuotes(words[index + 1]) : this.workspaceRoot;
-      const nextCwd = resolvePath(this.cwd, target);
+      const nextCwd = resolvePath(this.cwd, target, this.workspaceRoot);
       if (!isInside(this.workspaceRoot, nextCwd)) {
         segment.touchesOutsideWorkspace = true;
         analysis.touchesOutsideWorkspace = true;
@@ -236,7 +239,7 @@ export class LucenaShell {
     }
 
     for (const operand of pathOperands) {
-      const absolutePath = resolvePath(this.cwd, operand);
+      const absolutePath = resolvePath(this.cwd, operand, this.workspaceRoot);
       if (!isInside(this.workspaceRoot, absolutePath)) {
         segment.touchesOutsideWorkspace = true;
         analysis.touchesOutsideWorkspace = true;
@@ -318,8 +321,32 @@ function looksLikePath(value) {
   return value === '.' || value === '..' || value.startsWith('/') || value.startsWith('./') || value.startsWith('../') || value.includes('/');
 }
 
-function resolvePath(cwd, value) {
-  return isAbsolute(value) ? resolve(value) : resolve(cwd, value);
+function resolvePath(cwd, value, workspaceRoot = cwd) {
+  const text = String(value || '');
+  if (isWorkspaceAbsolutePath(text)) {
+    return resolve(workspaceRoot, text.replace(/^\/+/u, ''));
+  }
+  return isAbsolute(text) ? resolve(text) : resolve(cwd, text);
+}
+
+function normalizeWorkspaceAbsoluteCommandPaths(command, workspaceRoot) {
+  return String(command || '').replace(
+    /(^|[\s=:])\/(?!\/)(?!Applications(?:\/|$)|Library(?:\/|$)|System(?:\/|$)|Users(?:\/|$)|Volumes(?:\/|$)|bin(?:\/|$)|dev(?:\/|$)|etc(?:\/|$)|home(?:\/|$)|opt(?:\/|$)|private(?:\/|$)|proc(?:\/|$)|root(?:\/|$)|sbin(?:\/|$)|tmp(?:\/|$)|usr(?:\/|$)|var(?:\/|$))([^\s"'`$;&|<>)]*)/gu,
+    (_match, prefix, workspacePath) => `${prefix}${quoteShellWord(resolve(workspaceRoot, workspacePath))}`,
+  );
+}
+
+function quoteShellWord(value) {
+  const text = String(value || '');
+  if (!text) return "''";
+  if (/^[A-Za-z0-9_/@%+=:,.;*?[\]-]+$/u.test(text)) return text;
+  return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+function isWorkspaceAbsolutePath(value) {
+  const text = String(value || '').replace(/\\/g, '/');
+  if (!text.startsWith('/') || text.startsWith('//')) return false;
+  return !/^\/(?:Applications|Library|System|Users|Volumes|bin|dev|etc|home|opt|private|proc|root|sbin|tmp|usr|var)(?:\/|$)/u.test(text);
 }
 
 function isInside(root, candidate) {

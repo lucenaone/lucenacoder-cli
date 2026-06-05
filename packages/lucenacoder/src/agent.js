@@ -1,5 +1,5 @@
-import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, push, set, update, onChildAdded, onDisconnect, serverTimestamp, remove, get } from 'firebase/database';
+import { deleteApp, initializeApp } from 'firebase/app';
+import { getDatabase, goOffline, ref, push, set, update, onChildAdded, onDisconnect, serverTimestamp, remove, get } from 'firebase/database';
 import { spawn, spawnSync } from 'child_process';
 import { watch } from 'chokidar';
 import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'fs/promises';
@@ -10,6 +10,14 @@ import { buildIndex, reindexFile } from './cli-indexer.js';
 import { LucenaShell } from './lucena-shell.js';
 import { storeProToken } from './pro-token.js';
 import { createWorkspaceIgnore } from './ignore-rules.js';
+import {
+  isLikelyLongRunningCommand,
+  observeTerminalOutput,
+  resolveTerminalBoundary,
+  TerminalSessionRegistry,
+  terminalSessionSnapshot,
+  terminalReceipt,
+} from './agenticterminal/index.js';
 import {
   ensureWorkspaceBrainSqlite,
   getWorkspaceBrainThread,
@@ -34,6 +42,23 @@ const SEARCH_EXCLUDE_GLOBS = [
 const SEARCH_SKILLS_GLOB = '.WorkspaceBrain/skills/**';
 const TUNNEL_HEARTBEAT_INTERVAL_MS = 15_000;
 const REMOTE_STATUS_INTERVAL_MS = 15_000;
+const SHUTDOWN_CLEANUP_TIMEOUT_MS = 1_500;
+
+export function isLikelyLongRunningServerCommand(command = '') {
+  return isLikelyLongRunningCommand(command);
+}
+
+function withTimeout(promise, ms, fallback = null) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(fallback), ms);
+    })
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 // ── The CLI Jailer ──
 function getJailedPath(baseDir, rawPath) {
@@ -91,6 +116,7 @@ export class LucenaAgent {
     this.commandClients = new Map();
     this.remoteControlRegistrationNotice = '';
     this.shell = new LucenaShell(this.cwd);
+    this.terminalRegistry = new TerminalSessionRegistry();
     this.ignore = createWorkspaceIgnore(this.cwd);
   }
 
@@ -266,6 +292,9 @@ export class LucenaAgent {
     const { type, messageId } = command;
     switch (type) {
       case 'execute': return this.executeCommand(command);
+      case 'terminal_input': return this.terminalInputCmd(command);
+      case 'terminal_stop': return this.terminalStopCmd(command);
+      case 'terminal_read': return this.terminalReadCmd(command);
       case 'read_files': return this.readFileCmd(command);
       case 'file_put': return this.putFileCmd(command);
       case 'workspace_brain_read': return this.workspaceBrainReadCmd(command);
@@ -334,8 +363,57 @@ export class LucenaAgent {
     if (['done', 'error', 'pong'].includes(type)) this.commandClients.delete(messageId);
   }
 
-  async executeCommand({ messageId, command, mode = 'safe', approved = false, outsideWorkspaceApproved = false }) {
+  terminalOwner(command = {}) {
+    const owner = command.terminalOwner || {};
+    const runId = String(owner.runId || command.runId || '').trim();
+    return {
+      threadId: String(owner.threadId || command.threadId || '').trim(),
+      turnId: String(owner.turnId || command.turnId || '').trim(),
+      tabScope: String(owner.tabScope || command.tabScope || '').trim(),
+      workspaceId: String(owner.workspaceId || command.workspaceId || '').trim(),
+      tunnelId: String(owner.tunnelId || command.tunnelId || this.tunnelId || '').trim(),
+      runId,
+      ownerRunId: runId || String(command.clientId || '').trim() || 'local-tunnel-client',
+    };
+  }
+
+  async executeCommand(commandPayload) {
+    const { messageId, command, mode = 'safe', approved = false, outsideWorkspaceApproved = false } = commandPayload;
     let child;
+    const sessionId = messageId;
+    const owner = this.terminalOwner(commandPayload);
+    const ownerRunId = owner.ownerRunId;
+    let session = null;
+    let settled = false;
+    let boundaryTimer = null;
+
+    const foreground = this.terminalRegistry.foregroundSession(ownerRunId);
+    if (foreground) {
+      const boundary = terminalSessionSnapshot(foreground, { reason: 'existing_foreground_terminal_session' });
+      return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
+        exitCode: 0,
+        terminalStatus: boundary.status,
+        terminalReason: boundary.reason,
+        sessionId: boundary.sessionId,
+        detectedUrls: boundary.detectedUrls,
+        backgroundProcess: true,
+        pid: boundary.pid || null,
+      });
+    }
+
+    const reusable = this.terminalRegistry.findReusable({ command, cwd: this.cwd });
+    if (reusable) {
+      const boundary = terminalSessionSnapshot(reusable, { reason: 'existing_matching_background_session' });
+      return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
+        exitCode: 0,
+        terminalStatus: boundary.status,
+        terminalReason: boundary.reason,
+        sessionId: boundary.sessionId,
+        detectedUrls: boundary.detectedUrls,
+        backgroundProcess: true,
+        pid: boundary.pid || null,
+      });
+    }
 
     try {
       child = this.shell.execute(command, { mode, approved, outsideWorkspaceApproved });
@@ -343,23 +421,138 @@ export class LucenaAgent {
       return this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }
 
+    session = this.terminalRegistry.create({
+      id: sessionId,
+      command,
+      cwd: this.cwd,
+      pid: child.pid || null,
+      ownerRunId,
+      threadId: owner.threadId,
+      turnId: owner.turnId,
+      tabScope: owner.tabScope,
+      workspaceId: owner.workspaceId,
+      tunnelId: owner.tunnelId,
+      runId: owner.runId,
+      child,
+    });
+
+    const finishBoundary = (boundary) => {
+      if (!boundary || settled) return;
+      settled = true;
+      if (boundaryTimer) clearTimeout(boundaryTimer);
+      this.terminalRegistry.releaseForeground(sessionId);
+      if (boundary.status === 'ready_background' || boundary.status === 'running' || boundary.status === 'blocked_for_input') {
+        child.__lucenaBackgroundReceiptSent = true;
+      }
+      this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
+        exitCode: boundary.exitCode ?? (boundary.status === 'failed' ? 1 : 0),
+        terminalStatus: boundary.status,
+        terminalReason: boundary.reason,
+        sessionId: boundary.sessionId,
+        detectedUrls: boundary.detectedUrls,
+        backgroundProcess: boundary.status === 'ready_background' || boundary.status === 'running' || boundary.status === 'blocked_for_input',
+        pid: child.pid || null,
+      });
+    };
+
+    const captureOutput = (data, stream) => {
+      const text = data.toString();
+      observeTerminalOutput(session, text, { stream });
+      return text;
+    };
+
     child.stdout?.on('data', (data) => {
-      this.pushResponse(messageId, 'output', this._sanitize(data.toString()));
+      const text = captureOutput(data, 'stdout');
+      if (!settled) this.pushResponse(messageId, 'output', this._sanitize(text));
+      finishBoundary(resolveTerminalBoundary(session));
     });
     child.stderr?.on('data', (data) => {
-      this.pushResponse(messageId, 'output', this._sanitize(data.toString()));
+      const text = captureOutput(data, 'stderr');
+      if (!settled) this.pushResponse(messageId, 'output', this._sanitize(text));
+      finishBoundary(resolveTerminalBoundary(session));
     });
 
-    // Immediately close stdin so commands that try to read it get EOF
-    // instead of hanging until the 60s timeout
-    try { child.stdin?.end(); } catch { /* already closed */ }
+    if (session.stdinPolicy === 'closed') {
+      try { child.stdin?.end(); } catch { /* already closed */ }
+    }
 
     child.on('close', (code) => {
-      this.pushResponse(messageId, 'done', '', { exitCode: code ?? 0 });
+      if (boundaryTimer) clearTimeout(boundaryTimer);
+      finishBoundary(resolveTerminalBoundary(session, { closed: true, exitCode: code ?? 0 }));
       this.activeCommands.delete(messageId);
+      this.terminalRegistry.close(sessionId, { exitCode: code ?? 0 });
     });
 
     this.activeCommands.set(messageId, child);
+    boundaryTimer = setTimeout(() => {
+      finishBoundary(resolveTerminalBoundary(session, { force: true }));
+    }, session.longRunning ? session.readyTimeoutMs : session.runningBoundaryTimeoutMs);
+  }
+
+  async terminalInputCmd({ messageId, sessionId, input = '' }) {
+    const session = this.terminalRegistry.get(sessionId);
+    const child = session?.child || this.activeCommands.get(sessionId);
+    if (!child || child.killed || !child.stdin?.writable) {
+      return this.pushResponse(messageId, 'error', `Terminal session is not accepting input: ${sessionId || 'missing session_id'}`);
+    }
+    try {
+      child.stdin.write(String(input ?? ''));
+      const boundary = terminalSessionSnapshot(session, { reason: 'terminal_input_sent' });
+      return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
+        exitCode: boundary.exitCode ?? 0,
+        terminalStatus: boundary.status,
+        terminalReason: boundary.reason,
+        sessionId: boundary.sessionId,
+        detectedUrls: boundary.detectedUrls,
+        backgroundProcess: ['ready_background', 'running', 'blocked_for_input'].includes(boundary.status),
+        pid: boundary.pid || null,
+      });
+    } catch (err) {
+      return this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async terminalStopCmd({ messageId, sessionId }) {
+    const session = this.terminalRegistry.get(sessionId);
+    const child = session?.child || this.activeCommands.get(sessionId);
+    if (!child) {
+      return this.pushResponse(messageId, 'done', `Terminal session is not running: ${sessionId || 'missing session_id'}`);
+    }
+    try {
+      const boundary = session ? terminalSessionSnapshot(session, { reason: 'terminal_session_stopped', status: 'stopped' }) : null;
+      child.kill('SIGTERM');
+      this.activeCommands.delete(sessionId);
+      this.terminalRegistry.remove(sessionId);
+      if (!boundary) return this.pushResponse(messageId, 'done', `Terminal session stopped: ${sessionId}.`);
+      return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
+        exitCode: boundary.exitCode ?? 0,
+        terminalStatus: 'stopped',
+        terminalReason: boundary.reason,
+        sessionId: boundary.sessionId,
+        detectedUrls: boundary.detectedUrls,
+        backgroundProcess: false,
+        pid: boundary.pid || null,
+      });
+    } catch (err) {
+      return this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async terminalReadCmd({ messageId, sessionId }) {
+    const session = this.terminalRegistry.get(sessionId);
+    if (!session) {
+      return this.pushResponse(messageId, 'error', `Terminal session not found: ${sessionId || 'missing session_id'}`);
+    }
+    const boundary = terminalSessionSnapshot(session, { reason: 'terminal_session_read' });
+    return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
+      exitCode: boundary.exitCode ?? 0,
+      terminalStatus: boundary.status,
+      terminalReason: boundary.reason,
+      sessionId: boundary.sessionId,
+      detectedUrls: boundary.detectedUrls,
+      backgroundProcess: ['ready_background', 'running', 'blocked_for_input'].includes(boundary.status),
+      pid: boundary.pid || null,
+    });
   }
 
   async readFileCmd({ messageId, path: filePath }) {
@@ -694,16 +887,21 @@ export class LucenaAgent {
   async shutdown() {
     for (const [messageId, child] of this.activeCommands) {
       child.kill('SIGTERM');
-      this.pushResponse(messageId, 'error', 'Command killed: tunnel shutting down');
+      if (!child.__lucenaBackgroundReceiptSent) {
+        this.pushResponse(messageId, 'error', 'Command killed: tunnel shutting down').catch(() => {});
+      }
     }
     this.activeCommands.clear();
+    this.terminalRegistry = new TerminalSessionRegistry();
 
-    if (this.watcher) await this.watcher.close();
+    if (this.watcher) await withTimeout(this.watcher.close(), SHUTDOWN_CLEANUP_TIMEOUT_MS);
     if (this.db) {
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
       if (this.remoteStatusTimer) clearInterval(this.remoteStatusTimer);
-      await remove(ref(this.db, `tunnels/${this.tunnelId}`));
+      await withTimeout(remove(ref(this.db, `tunnels/${this.tunnelId}`)), SHUTDOWN_CLEANUP_TIMEOUT_MS);
+      try { goOffline(this.db); } catch { /* Firebase may already be disconnected. */ }
     }
+    if (this.app) await withTimeout(deleteApp(this.app), SHUTDOWN_CLEANUP_TIMEOUT_MS);
 
     this.connected = false;
   }
