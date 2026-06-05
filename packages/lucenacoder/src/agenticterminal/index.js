@@ -50,14 +50,7 @@ export function createTerminalSession({
   id,
   command,
   cwd = "",
-  pid = null,
   ownerRunId = "",
-  threadId = "",
-  turnId = "",
-  tabScope = "",
-  workspaceId = "",
-  tunnelId = "",
-  runId = "",
   purpose = "",
   child = null,
   now = Date.now(),
@@ -72,14 +65,7 @@ export function createTerminalSession({
     id,
     command: String(command),
     cwd: String(cwd || ""),
-    pid,
     ownerRunId: String(ownerRunId || ""),
-    threadId: String(threadId || ""),
-    turnId: String(turnId || ""),
-    tabScope: String(tabScope || ""),
-    workspaceId: String(workspaceId || ""),
-    tunnelId: String(tunnelId || ""),
-    runId: String(runId || ""),
     purpose: String(purpose || ""),
     child,
     status: "running",
@@ -273,18 +259,9 @@ export function terminalReceipt(boundary, options = {}) {
     `status: ${boundary.status}`,
     `reason: ${boundary.reason}`,
     `command: ${boundary.command}`,
-    `session_id: ${boundary.sessionId}`,
   ];
   if (boundary.cwd) lines.push(`cwd: ${boundary.cwd}`);
-  if (boundary.threadId) lines.push(`thread_id: ${boundary.threadId}`);
-  if (boundary.turnId) lines.push(`turn_id: ${boundary.turnId}`);
-  if (boundary.tabScope) lines.push(`tab_scope: ${boundary.tabScope}`);
-  if (boundary.workspaceId) lines.push(`workspace_id: ${boundary.workspaceId}`);
-  if (boundary.tunnelId) lines.push(`tunnel_id: ${boundary.tunnelId}`);
-  if (boundary.runId) lines.push(`run_id: ${boundary.runId}`);
-  if (boundary.pid != null) lines.push(`pid: ${boundary.pid}`);
-  if (boundary.dedupeKey) lines.push(`dedupe_key: ${boundary.dedupeKey}`);
-  if (boundary.stdinPolicy) lines.push(`stdin_policy: ${boundary.stdinPolicy}`);
+  if (options.includeSessionId !== false && boundary.sessionId) lines.push(`session_id: ${boundary.sessionId}`);
   if (boundary.exitCode != null) lines.push(`exit_code: ${boundary.exitCode}`);
   if (boundary.signal) lines.push(`signal: ${boundary.signal}`);
   if (boundary.detectedUrls?.length) {
@@ -313,9 +290,13 @@ export function terminalReceipt(boundary, options = {}) {
   if (options.includeJson) {
     lines.push("");
     lines.push("receipt_json:");
-    lines.push(JSON.stringify(boundary));
+    lines.push(JSON.stringify(publicTerminalBoundary(boundary)));
   }
   return lines.join("\n");
+}
+
+export function terminalUserReceipt(boundary) {
+  return terminalReceipt(boundary, { includeSessionId: false });
 }
 
 export function terminalSessionSnapshot(session, { reason = "terminal_session_snapshot", status = "" } = {}) {
@@ -326,13 +307,6 @@ export function terminalSessionSnapshot(session, { reason = "terminal_session_sn
     command: session.command,
     cwd: session.cwd,
     sessionId: session.id,
-    pid: session.pid,
-    threadId: session.threadId,
-    turnId: session.turnId,
-    tabScope: session.tabScope,
-    workspaceId: session.workspaceId,
-    tunnelId: session.tunnelId,
-    runId: session.runId,
     exitCode: session.exitCode,
     signal: session.signal,
     detectedUrls: [...(session.detectedUrls || [])],
@@ -355,13 +329,6 @@ function markBoundary(session, { status, reason }) {
     command: session.command,
     cwd: session.cwd,
     sessionId: session.id,
-    pid: session.pid,
-    threadId: session.threadId,
-    turnId: session.turnId,
-    tabScope: session.tabScope,
-    workspaceId: session.workspaceId,
-    tunnelId: session.tunnelId,
-    runId: session.runId,
     exitCode: session.exitCode,
     signal: session.signal,
     detectedUrls: [...session.detectedUrls],
@@ -372,6 +339,21 @@ function markBoundary(session, { status, reason }) {
     longRunning: session.longRunning,
     stdinPolicy: session.stdinPolicy,
     dedupeKey: session.dedupeKey,
+  };
+}
+
+function publicTerminalBoundary(boundary = {}) {
+  return {
+    status: boundary.status,
+    reason: boundary.reason,
+    command: boundary.command,
+    cwd: boundary.cwd,
+    sessionId: boundary.sessionId,
+    exitCode: boundary.exitCode,
+    signal: boundary.signal,
+    detectedUrls: [...(boundary.detectedUrls || [])],
+    inputPrompt: boundary.inputPrompt,
+    recentOutput: boundary.recentOutput,
   };
 }
 

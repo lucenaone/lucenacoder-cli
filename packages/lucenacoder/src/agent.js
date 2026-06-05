@@ -367,12 +367,6 @@ export class LucenaAgent {
     const owner = command.terminalOwner || {};
     const runId = String(owner.runId || command.runId || '').trim();
     return {
-      threadId: String(owner.threadId || command.threadId || '').trim(),
-      turnId: String(owner.turnId || command.turnId || '').trim(),
-      tabScope: String(owner.tabScope || command.tabScope || '').trim(),
-      workspaceId: String(owner.workspaceId || command.workspaceId || '').trim(),
-      tunnelId: String(owner.tunnelId || command.tunnelId || this.tunnelId || '').trim(),
-      runId,
       ownerRunId: runId || String(command.clientId || '').trim() || 'local-tunnel-client',
     };
   }
@@ -397,7 +391,6 @@ export class LucenaAgent {
         sessionId: boundary.sessionId,
         detectedUrls: boundary.detectedUrls,
         backgroundProcess: true,
-        pid: boundary.pid || null,
       });
     }
 
@@ -411,7 +404,6 @@ export class LucenaAgent {
         sessionId: boundary.sessionId,
         detectedUrls: boundary.detectedUrls,
         backgroundProcess: true,
-        pid: boundary.pid || null,
       });
     }
 
@@ -425,14 +417,7 @@ export class LucenaAgent {
       id: sessionId,
       command,
       cwd: this.cwd,
-      pid: child.pid || null,
       ownerRunId,
-      threadId: owner.threadId,
-      turnId: owner.turnId,
-      tabScope: owner.tabScope,
-      workspaceId: owner.workspaceId,
-      tunnelId: owner.tunnelId,
-      runId: owner.runId,
       child,
     });
 
@@ -451,7 +436,6 @@ export class LucenaAgent {
         sessionId: boundary.sessionId,
         detectedUrls: boundary.detectedUrls,
         backgroundProcess: boundary.status === 'ready_background' || boundary.status === 'running' || boundary.status === 'blocked_for_input',
-        pid: child.pid || null,
       });
     };
 
@@ -505,7 +489,6 @@ export class LucenaAgent {
         sessionId: boundary.sessionId,
         detectedUrls: boundary.detectedUrls,
         backgroundProcess: ['ready_background', 'running', 'blocked_for_input'].includes(boundary.status),
-        pid: boundary.pid || null,
       });
     } catch (err) {
       return this.pushResponse(messageId, 'error', this._sanitize(err.message));
@@ -531,7 +514,6 @@ export class LucenaAgent {
         sessionId: boundary.sessionId,
         detectedUrls: boundary.detectedUrls,
         backgroundProcess: false,
-        pid: boundary.pid || null,
       });
     } catch (err) {
       return this.pushResponse(messageId, 'error', this._sanitize(err.message));
@@ -551,7 +533,6 @@ export class LucenaAgent {
       sessionId: boundary.sessionId,
       detectedUrls: boundary.detectedUrls,
       backgroundProcess: ['ready_background', 'running', 'blocked_for_input'].includes(boundary.status),
-      pid: boundary.pid || null,
     });
   }
 
