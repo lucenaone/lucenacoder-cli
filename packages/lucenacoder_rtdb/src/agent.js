@@ -1,9 +1,11 @@
+import { deleteApp, initializeApp } from 'firebase/app';
+import { getDatabase, goOffline, ref, push, set, update, onChildAdded, onDisconnect, serverTimestamp, remove, get } from 'firebase/database';
 import { spawn, spawnSync } from 'child_process';
 import { watch } from 'chokidar';
 import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'fs/promises';
 import { join, resolve, dirname, basename, relative, isAbsolute, extname } from 'path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { BrokerTransport } from './broker-transport.js';
+import { FIREBASE_CONFIG } from './config.js';
 import { buildIndex, reindexFile } from './cli-indexer.js';
 import { LucenaShell } from './lucena-shell.js';
 import { storeProToken } from './pro-token.js';
@@ -100,7 +102,8 @@ export class LucenaAgent {
     this.cwd = resolve(cwd);
     this.proToken = options.proToken || null;
     this.tunnelId = crypto.randomUUID();
-    this.transport = new BrokerTransport();
+    this.app = null;
+    this.db = null;
     this.watcher = null;
     this.activeCommands = new Map();
     this.connected = false;
@@ -171,61 +174,76 @@ export class LucenaAgent {
     const { stats } = this.indexData;
     process.stdout.write(`\r  ${'\x1b[32m'}✔ Indexed ${stats.filesParsed} files — ${stats.symbolCount} symbols across ${stats.fileCount} files${'\x1b[0m'}  \n`);
 
-    await this.transport.connect({
-      tunnelId: this.tunnelId,
-      cwdName: basename(this.cwd),
-      platform: process.platform,
-      pid: process.pid,
-      capabilities: {
-        files: true,
-        terminal: true,
-        workspaceBrain: true,
-        index: true,
-        env: true,
-      },
-      onBrowserConnected: async (data = {}) => {
-        this.browserConnected = true;
-        if (typeof data.stripCwd === 'boolean') {
-          this.stripCwd = data.stripCwd;
-        }
-        if (data.proToken) {
-          await storeProToken({ tokenForPro: data.proToken, email: data.proEmail });
-          console.log(`  ${'\x1b[36m'}PRO token stored. Future runs can auto-launch.${'\x1b[0m'}`);
-          if (this.remoteControlRegistrationNotice) {
-            console.log(this.remoteControlRegistrationNotice);
-            this.remoteControlRegistrationNotice = '';
-          }
-        }
-      },
-      onCommand: async (command) => {
-        if (command.messageId) {
-          this.commandClients.set(command.messageId, command.clientId || null);
-        }
-        try {
-          await this.handleCommand(command);
-        } catch (err) {
-          this.pushResponse(command.messageId, 'error', this._sanitize(err.message));
-        }
-      },
-      onDisconnect: () => {
-        this.connected = false;
-      },
-      onError: (error) => {
-        console.warn('[broker] transport error:', error?.message || error);
-      },
+    this.app = initializeApp(FIREBASE_CONFIG, `agent-${this.tunnelId}`);
+    this.db = getDatabase(this.app);
+    const tunnelRef = ref(this.db, `tunnels/${this.tunnelId}`);
+
+    await set(tunnelRef, {
+      meta: {
+        createdAt: serverTimestamp(),
+        lastHeartbeatAt: Date.now(),
+        cwdName: basename(this.cwd),  // Never expose full cwd to the browser
+        status: 'active',
+        online: true,
+        pid: process.pid,
+        platform: process.platform
+      }
     });
+
+    onChildAdded(ref(this.db, `.info`), () => {});
+    onDisconnect(tunnelRef).remove();
     await this.publishStartupSnapshot();
 
     this.heartbeatTimer = setInterval(() => {
-      this.transport.sendPresence({
+      update(ref(this.db, `tunnels/${this.tunnelId}/meta`), {
         lastHeartbeatAt: Date.now(),
         cwdName: basename(this.cwd),
         status: 'active',
         online: true,
         pid: process.pid,
         platform: process.platform
-      });
+      }).catch(() => {});
     }, TUNNEL_HEARTBEAT_INTERVAL_MS);
+
+    // ── Listen for browser connect events ──
+    // Browser connect is presence/session metadata. The startup snapshot is
+    // already published before the tunnel URL is returned.
+    onChildAdded(ref(this.db, `tunnels/${this.tunnelId}/browserConnect`), async (snapshot) => {
+      const data = snapshot.val();
+      if (!data) return;
+      remove(snapshot.ref);
+      this.browserConnected = true;
+      
+      // Browser tells us whether to strip cwd from output
+      if (typeof data.stripCwd === 'boolean') {
+        this.stripCwd = data.stripCwd;
+      }
+
+      if (data.proToken) {
+        await storeProToken({ tokenForPro: data.proToken, email: data.proEmail });
+        console.log(`  ${'\x1b[36m'}PRO token stored. Future runs can auto-launch.${'\x1b[0m'}`);
+        if (this.remoteControlRegistrationNotice) {
+          console.log(this.remoteControlRegistrationNotice);
+          this.remoteControlRegistrationNotice = '';
+        }
+      }
+    });
+
+    const commandsRef = ref(this.db, `tunnels/${this.tunnelId}/commands`);
+    onChildAdded(commandsRef, async (snapshot) => {
+      const command = snapshot.val();
+      if (!command) return;
+      remove(snapshot.ref);
+      if (command.messageId) {
+        this.commandClients.set(command.messageId, command.clientId || null);
+      }
+
+      try {
+        await this.handleCommand(command);
+      } catch (err) {
+        this.pushResponse(command.messageId, 'error', this._sanitize(err.message));
+      }
+    });
 
     if (this.proToken) this.startRemoteControlPresence();
 
@@ -241,13 +259,14 @@ export class LucenaAgent {
 
   // ── Publish the startup artifact before exposing the tunnel URL ──
   async publishStartupSnapshot() {
-    this.transport.sendEvent('index_snapshot', {
+    const snapshotRef = ref(this.db, `tunnels/${this.tunnelId}/indexSnapshot`);
+    await set(snapshotRef, {
       files: this.indexData.files,
       symbols: this.indexData.symbols,
       stats: this.indexData.stats,
-      timestamp: Date.now(),
+      timestamp: serverTimestamp(),
     });
-    console.log(`  ${'\x1b[36m'}📡 Index snapshot sent to broker${'\x1b[0m'}`);
+    console.log(`  ${'\x1b[36m'}📡 Index snapshot pushed to browser${'\x1b[0m'}`);
   }
 
   // ── Push an incremental delta when a file changes ──
@@ -261,10 +280,11 @@ export class LucenaAgent {
     const delta = await reindexFile(this.cwd, '/' + relPath);
     if (!delta) return;
 
-    this.transport.sendEvent('index_delta', {
+    const deltaRef = ref(this.db, `tunnels/${this.tunnelId}/indexDeltas`);
+    push(deltaRef, {
       filePath: delta.filePath,
       symbols: delta.symbols,
-      timestamp: Date.now(),
+      timestamp: serverTimestamp(),
     });
   }
 
@@ -298,8 +318,9 @@ export class LucenaAgent {
   }
 
   startRemoteControlPresence() {
-    if (this.remoteStatusTimer) return;
-    const publishStatus = () => this.transport.sendPresence({
+    if (!this.db || this.remoteStatusTimer) return;
+    const statusRef = ref(this.db, `tunnels/${this.tunnelId}/remoteControl/desktop/status`);
+    const publishStatus = () => set(statusRef, {
       online: true,
       linkStatus: 'local',
       platform: process.platform,
@@ -308,9 +329,17 @@ export class LucenaAgent {
       chatStatus: 'idle',
       workerStatus: 'online',
       updatedAt: Date.now(),
-    });
+    }).catch(() => {});
     publishStatus();
     this.remoteStatusTimer = setInterval(publishStatus, REMOTE_STATUS_INTERVAL_MS);
+    onDisconnect(statusRef).set({
+      online: false,
+      linkStatus: 'local',
+      platform: process.platform,
+      projectName: basename(this.cwd),
+      workerStatus: 'offline',
+      updatedAt: Date.now(),
+    });
   }
 
   async storeProTokenCmd({ messageId, tokenForPro, email }) {
@@ -320,13 +349,16 @@ export class LucenaAgent {
   }
 
   async pushResponse(messageId, type, text, extra = {}) {
+    const responsesRef = ref(this.db, `tunnels/${this.tunnelId}/responses`);
     const clientId = this.commandClients.get(messageId) || null;
-    this.transport.sendResponse({
+    const responseRef = push(responsesRef);
+    await set(responseRef, {
       messageId,
       clientId,
       type,
       text,
-      extra
+      timestamp: serverTimestamp(),
+      ...extra
     });
     if (['done', 'error', 'pong'].includes(type)) this.commandClients.delete(messageId);
   }
@@ -540,14 +572,15 @@ export class LucenaAgent {
         throw new Error(`Write verification failed for ${relPath}`);
       }
       if (source) {
+        const changesRef = ref(this.db, `tunnels/${this.tunnelId}/fileChanges`);
         try {
-          this.transport.sendEvent('file_change', {
+          await push(changesRef, {
             event: existed ? 'change' : 'add',
             path: relPath,
             source,
             originalContent,
             content: nextContent,
-            timestamp: Date.now()
+            timestamp: serverTimestamp()
           });
         } catch (err) {
           console.warn(`Failed to publish file change event for ${relPath}:`, err?.message || err);
@@ -818,10 +851,11 @@ export class LucenaAgent {
         return; 
       }
 
-      this.transport.sendEvent('file_change', {
+      const changesRef = ref(this.db, `tunnels/${this.tunnelId}/fileChanges`);
+      push(changesRef, {
         event,
         path: normalizedRelPath,
-        timestamp: Date.now()
+        timestamp: serverTimestamp()
       });
 
       // ── Push incremental index delta for changed files ──
@@ -842,9 +876,13 @@ export class LucenaAgent {
     this.terminalRegistry = new TerminalSessionRegistry();
 
     if (this.watcher) await withTimeout(this.watcher.close(), SHUTDOWN_CLEANUP_TIMEOUT_MS);
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    if (this.remoteStatusTimer) clearInterval(this.remoteStatusTimer);
-    await withTimeout(this.transport.close(), SHUTDOWN_CLEANUP_TIMEOUT_MS);
+    if (this.db) {
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      if (this.remoteStatusTimer) clearInterval(this.remoteStatusTimer);
+      await withTimeout(remove(ref(this.db, `tunnels/${this.tunnelId}`)), SHUTDOWN_CLEANUP_TIMEOUT_MS);
+      try { goOffline(this.db); } catch { /* Firebase may already be disconnected. */ }
+    }
+    if (this.app) await withTimeout(deleteApp(this.app), SHUTDOWN_CLEANUP_TIMEOUT_MS);
 
     this.connected = false;
   }
