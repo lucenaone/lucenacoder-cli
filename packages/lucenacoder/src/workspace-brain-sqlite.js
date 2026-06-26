@@ -2,7 +2,8 @@ import initSqlJs from 'sql.js';
 import { createRequire } from 'module';
 import { mkdir, readFile, rename, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname } from 'path';
+import { workspaceBrainSqlitePath } from './lucena-cache.js';
 
 const require = createRequire(import.meta.url);
 const sqliteWasmPath = require.resolve('sql.js/dist/sql-wasm.wasm');
@@ -68,21 +69,21 @@ export async function getWorkspaceBrainThread(cwd, requestedThreadId = '') {
 
 export async function upsertWorkspaceBrainThread(cwd, thread) {
   if (!thread?.id) throw new Error('thread.id is required');
-  const state = await loadWorkspaceBrainState(cwd);
-  const threads = state.threads.some((item) => item.id === thread.id)
-    ? state.threads.map((item) => (item.id === thread.id ? thread : item))
-    : [thread, ...state.threads];
-  await saveWorkspaceBrainState(cwd, {
-    threads,
-    tabThreadMap: state.tabThreadMap,
-    project: state.project,
+  return enqueueWorkspaceBrainWrite(async () => {
+    const db = await openWorkspaceBrainDb(cwd, { waitForWrites: false });
+    try {
+      writeThread(db, thread);
+      await saveWorkspaceBrainDb(cwd, db);
+    } finally {
+      db.close();
+    }
   });
 }
 
 async function openWorkspaceBrainDb(cwd, { waitForWrites = true } = {}) {
   if (waitForWrites) await writeQueue;
   const SQL = await getSql();
-  const dbPath = workspaceBrainDbPath(cwd);
+  const dbPath = await workspaceBrainSqlitePath(cwd);
   const bytes = existsSync(dbPath) ? new Uint8Array(await readFile(dbPath)) : null;
   return bytes?.length
     ? await openVerifiedDatabase(SQL, cwd, bytes)
@@ -90,8 +91,8 @@ async function openWorkspaceBrainDb(cwd, { waitForWrites = true } = {}) {
 }
 
 async function saveWorkspaceBrainDb(cwd, db) {
-  const dbPath = workspaceBrainDbPath(cwd);
-  const backupPath = workspaceBrainBackupPath(cwd);
+  const dbPath = await workspaceBrainSqlitePath(cwd);
+  const backupPath = workspaceBrainBackupPath(dbPath);
   const bytes = Buffer.from(db.export());
   verifySqliteBytes(bytes);
   await mkdir(dirname(dbPath), { recursive: true });
@@ -115,7 +116,7 @@ async function openVerifiedDatabase(SQL, cwd, primaryBytes) {
   try {
     return createUsableDatabase(SQL, primaryBytes);
   } catch {
-    const backupPath = workspaceBrainBackupPath(cwd);
+    const backupPath = workspaceBrainBackupPath(await workspaceBrainSqlitePath(cwd));
     if (existsSync(backupPath)) {
       try {
         const backupBytes = new Uint8Array(await readFile(backupPath));
@@ -156,12 +157,8 @@ function verifySqliteBytes(bytes) {
   }
 }
 
-function workspaceBrainDbPath(cwd) {
-  return join(cwd, '.WorkspaceBrain', 'workspace.sqlite');
-}
-
-function workspaceBrainBackupPath(cwd) {
-  return `${workspaceBrainDbPath(cwd)}.bak`;
+function workspaceBrainBackupPath(dbPath) {
+  return `${dbPath}.bak`;
 }
 
 function ensureSchema(db) {
@@ -438,6 +435,103 @@ function writeThreads(db, threads) {
         }
       }
     }
+    insertThread.free();
+    insertTurn.free();
+    insertRawEvent.free();
+    insertModelTrace.free();
+    db.run('COMMIT');
+  } catch (error) {
+    db.run('ROLLBACK');
+    throw error;
+  }
+}
+
+function writeThread(db, thread) {
+  db.run('BEGIN');
+  try {
+    const insertThread = db.prepare('INSERT OR REPLACE INTO threads (id, title, summary, tags_json, status, model, active_plan_json, ledger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertTurn = db.prepare('INSERT OR REPLACE INTO turns (id, thread_id, turn_index, user_message_json, started_at, completed_at, token_usage_json, tool_count, model, metadata_json, remote_tunnel_run_id, cloud_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertRawEvent = db.prepare('INSERT INTO raw_events (storage_id, id, thread_id, turn_id, event_index, type, role, tool_call_id, name, status, content, args_json, result, error, observation_json, metadata_json, images_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertModelTrace = db.prepare('INSERT INTO model_call_traces (storage_id, turn_id, trace_index, iteration, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, message_count, assistant_chars, had_tool_calls, available_tools_json, tool_calls_json, trace_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+
+    insertThread.run([
+      thread.id,
+      thread.title || 'New Thread',
+      thread.summary || '',
+      json(thread.tags || []),
+      thread.status || 'active',
+      thread.model || null,
+      nullableJson(thread.activePlan),
+      json(thread.ledger || []),
+      thread.createdAt || null,
+      thread.updatedAt || thread.createdAt || null,
+    ]);
+
+    const turns = thread.turns || [];
+    pruneMissingTurns(db, thread.id, turns);
+
+    for (const [turnIndex, turn] of turns.entries()) {
+      const rawEvents = rawEventsFromTurn(turn);
+      db.run('DELETE FROM raw_events WHERE turn_id = ?', [turn.id]);
+      db.run('DELETE FROM model_call_traces WHERE turn_id = ?', [turn.id]);
+      insertTurn.run([
+        turn.id,
+        thread.id,
+        turnIndex,
+        nullableJson(turn.userMessage || null),
+        turn.startedAt || null,
+        turn.completedAt || null,
+        json(turn.tokenUsage || { prompt: 0, completion: 0, total: 0 }),
+        Number(turn.toolCount || 0),
+        turn.model || null,
+        nullableJson(turnMetadataForSql(turn)),
+        turn.remoteTunnelRunId || null,
+        turn.cloudRunId || null,
+      ]);
+      for (const [eventIndex, event] of rawEvents.entries()) {
+        insertRawEvent.run([
+          `${turn.id}:${eventIndex}`,
+          event.id || `${turn.id}:raw:${eventIndex}`,
+          thread.id,
+          turn.id,
+          eventIndex,
+          event.type || 'message',
+          event.role || null,
+          event.toolCallId || null,
+          event.name || null,
+          event.status || null,
+          event.content || null,
+          nullableJson(event.args || null),
+          event.result || null,
+          event.error || null,
+          nullableJson(event.observation || null),
+          nullableJson(event.metadata || null),
+          nullableJson(event.images || null),
+          event.createdAt || null,
+        ]);
+      }
+      for (const [traceIndex, trace] of (turn.modelCallTraces || []).entries()) {
+        const usage = trace.response?.usage || {};
+        insertModelTrace.run([
+          `${turn.id}:${traceIndex}`,
+          turn.id,
+          traceIndex,
+          trace.iteration || null,
+          trace.response?.model || turn.model || null,
+          Number(usage.prompt_tokens || 0),
+          Number(usage.completion_tokens || 0),
+          Number(usage.total_tokens || 0),
+          Number(usage.cached_tokens || usage.prompt_tokens_details?.cached_tokens || 0),
+          Number(trace.messageCount || 0),
+          Number(trace.response?.assistantChars || 0),
+          trace.response?.hadToolCalls ? 1 : 0,
+          json(trace.availableTools || []),
+          json(trace.toolCalls || []),
+          json(trace),
+        ]);
+      }
+    }
+
     insertThread.free();
     insertTurn.free();
     insertRawEvent.free();

@@ -1,12 +1,15 @@
 {
   "name": "lucenacoder",
-  "version": "1.3.4",
+  "version": "1.4.0",
   "description": "Loads the LucenaCoder Relay Tunnel via @lucenaone/coder",
   "dependencies": {
-    "@lucenaone/coder": "1.3.4"
+    "@lucenaone/coder": "1.4.0"
   },
   "bin": {
     "lucenacoder": "./bin/lucena.js"
+  },
+  "scripts": {
+    "prepublishOnly": "node ../../scripts/sync-alias-version.mjs"
   },
   "engines": {
     "node": ">=20"

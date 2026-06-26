@@ -1,0 +1,10 @@
+{
+  "name": "lucenacoder-cli",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "sync:alias-version": "node scripts/sync-alias-version.mjs"
+  }
+}

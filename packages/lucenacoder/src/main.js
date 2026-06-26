@@ -37,6 +37,29 @@ ${c.dim}  =========================================${c.reset}
   to your local folders.
 `;
 
+function desktopPlatformLabel() {
+  if (process.platform === 'darwin') return 'macOS';
+  if (process.platform === 'win32') return 'Windows';
+  return 'Linux';
+}
+
+function desktopDownloadUrl() {
+  const platform = process.platform === 'darwin'
+    ? 'mac'
+    : process.platform === 'win32'
+      ? 'windows'
+      : 'linux';
+  return `https://lucenacoder.com/download/${platform}`;
+}
+
+function printDesktopDownloadHint() {
+  const osLabel = desktopPlatformLabel();
+  const url = desktopDownloadUrl();
+  console.log('');
+  console.log(`  ${c.dim}Skip the tunnel?${c.reset}`);
+  console.log(`  Download LucenaCoder for ${osLabel}: ${c.bold}${url}${c.reset}`);
+}
+
 function openBrowser(url) {
   const command = process.platform === 'darwin'
     ? 'open'
@@ -97,9 +120,9 @@ export async function main() {
         pid: process.pid,
       });
       if (registered.ok) {
-        agent.setRemoteControlRegistrationNotice(`  ${c.cyan}RemoteControl registered.${c.reset} This run is visible on lucenacoder.com/rc.`);
+        console.log(`  ${c.cyan}RemoteControl registered.${c.reset} This run is visible on lucenacoder.com/rc.`);
       } else {
-        agent.setRemoteControlRegistrationNotice(`  ${c.yellow}RemoteControl registration failed.${c.reset} ${registered.error || 'Run will not appear in the remote list.'}`);
+        console.log(`  ${c.yellow}RemoteControl registration failed.${c.reset} ${registered.error || 'Run will not appear in the remote list.'}`);
       }
     }
     console.log(`  ${c.green}✔ Tunnel active!${c.reset}\n`);
@@ -134,7 +157,8 @@ export async function main() {
     if (!proStatus.valid) {
       console.log(`\n  ${c.dim}Open the URL above in your browser to connect.${c.reset}`);
     }
-    console.log(`  ${c.dim}Press Ctrl+C to disconnect${c.reset}\n`);
+    printDesktopDownloadHint();
+    console.log(`\n  ${c.dim}Press Ctrl+C to disconnect${c.reset}\n`);
   } catch (err) {
     console.error(`\n  ${c.yellow}✖ Failed to start tunnel: ${err.message}${c.reset}\n`);
     process.exit(1);

@@ -2,17 +2,15 @@ import { spawn, spawnSync } from 'child_process';
 import { watch } from 'chokidar';
 import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'fs/promises';
 import { join, resolve, dirname, basename, relative, isAbsolute, extname } from 'path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync } from 'fs';
 import { BrokerTransport } from './broker-transport.js';
 import { buildIndex, reindexFile } from './cli-indexer.js';
 import { LucenaShell } from './lucena-shell.js';
-import { storeProToken } from './pro-token.js';
+import { NativeTerminalCore } from './native-terminal-core.js';
+import { storeProToken, readStoredProToken } from './pro-token.js';
 import { createWorkspaceIgnore } from './ignore-rules.js';
 import {
   isLikelyLongRunningCommand,
-  observeTerminalOutput,
-  resolveTerminalBoundary,
-  TerminalSessionRegistry,
   terminalSessionSnapshot,
   terminalReceipt,
 } from './agenticterminal/index.js';
@@ -23,6 +21,14 @@ import {
   saveWorkspaceBrainState,
   upsertWorkspaceBrainThread,
 } from './workspace-brain-sqlite.js';
+import {
+  ensureWorkspaceKitchenSqlite,
+  indexWorkspaceKitchen,
+  indexWorkspaceKitchenPath,
+  readWorkspaceKitchenSqliteBytes,
+  removeWorkspaceKitchenPath,
+  workspaceKitchenSqliteExists,
+} from './workspace-kitchen-store.js';
 
 const SEARCH_GLOB = '*.{js,jsx,ts,tsx,json,md,css,html,py,rb,go,rs,dart}';
 const SEARCH_EXCLUDE_GLOBS = [
@@ -60,26 +66,24 @@ function withTimeout(promise, ms, fallback = null) {
 
 // ── The CLI Jailer ──
 function getJailedPath(baseDir, rawPath) {
-  let p = rawPath.replace(/\\/g, '/');
-  
-  // If the AI hallucinates the absolute path of the workspace, dynamically strip it out
-  const normalizedBase = baseDir.replace(/\\/g, '/');
-  if (p.startsWith(normalizedBase)) {
-    p = p.slice(normalizedBase.length);
+  const normalizedBase = resolve(baseDir).replace(/\\/g, '/').replace(/\/+$/, '');
+  const text = String(rawPath || '').replace(/\\/g, '/').trim();
+  if (!text) return normalizedBase;
+
+  const resolvedPath = isFilesystemAbsolutePath(text)
+    ? resolve(text)
+    : resolve(normalizedBase, text.replace(/^\/+/, ''));
+  const normalizedPath = resolvedPath.replace(/\\/g, '/').replace(/\/+$/, '');
+
+  if (normalizedPath !== normalizedBase && !normalizedPath.startsWith(`${normalizedBase}/`)) {
+    throw new Error('Path is outside this workspace');
   }
-  
-  // Strip leading slashes to force relative resolution
-  p = p.replace(/^\/+/, '');
-  
-  const parts = p.split('/').filter(part => part !== '.' && part !== '');
-  const safeParts = [];
-  
-  for (const part of parts) {
-    if (part === '..') safeParts.pop(); // Traversal clamping
-    else safeParts.push(part);
-  }
-  
-  return resolve(baseDir, safeParts.join('/'));
+
+  return normalizedPath;
+}
+
+function isFilesystemAbsolutePath(path = '') {
+  return /^[A-Za-z]:\//u.test(path) || path.startsWith('/');
 }
 
 // ── Path Sanitizer ──
@@ -112,8 +116,9 @@ export class LucenaAgent {
     this.heartbeatTimer = null;
     this.commandClients = new Map();
     this.remoteControlRegistrationNotice = '';
+    this.proTokenNoticeShown = false;
     this.shell = new LucenaShell(this.cwd);
-    this.terminalRegistry = new TerminalSessionRegistry();
+    this.terminalCore = new NativeTerminalCore({ cwd: this.cwd, workspaceEnv: this.shell.workspaceEnv });
     this.ignore = createWorkspaceIgnore(this.cwd);
   }
 
@@ -126,38 +131,12 @@ export class LucenaAgent {
     return this.ignore.ignoresPath(relative(this.cwd, fullPath));
   }
 
-  _scaffoldWorkspaceBrain() {
-    const brainDir = join(this.cwd, '.WorkspaceBrain');
-    const subdirs = ['skills'];
-    try {
-      if (!existsSync(brainDir)) mkdirSync(brainDir, { recursive: true });
-      for (const sub of subdirs) {
-        const subPath = join(brainDir, sub);
-        if (!existsSync(subPath)) mkdirSync(subPath, { recursive: true });
-      }
-      this._ensureWorkspaceBrainGitignore();
-    } catch (err) {
-      // Non-fatal — the brain is best-effort
-      console.warn('[workspace-brain] scaffold failed:', err.message);
-    }
-  }
-
-  _ensureWorkspaceBrainGitignore() {
-    const gitignorePath = join(this.cwd, '.gitignore');
-    const existing = existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf8') : '';
-    const lines = existing.split(/\r?\n/).map((line) => line.trim());
-    if (lines.includes('.WorkspaceBrain') || lines.includes('.WorkspaceBrain/')) return;
-    const nextContent = existing
-      ? `${existing}${existing.endsWith('\n') ? '' : '\n'}.WorkspaceBrain\n`
-      : '.WorkspaceBrain\n';
-    writeFileSync(gitignorePath, nextContent);
-  }
-
   async start() {
-    // Ensure .WorkspaceBrain/ exists on disk with subdirectories
-    this._scaffoldWorkspaceBrain();
     await ensureWorkspaceBrainSqlite(this.cwd).catch((err) => {
       console.warn('[workspace-brain] sqlite init failed:', err.message);
+    });
+    await ensureWorkspaceKitchenSqlite(this.cwd).catch((err) => {
+      console.warn('[workspace-kitchen] sqlite init failed:', err.message);
     });
 
     // The tunnel URL must not become live until the CLI has the startup
@@ -170,16 +149,21 @@ export class LucenaAgent {
     this.indexData = await this.indexPromise;
     const { stats } = this.indexData;
     process.stdout.write(`\r  ${'\x1b[32m'}✔ Indexed ${stats.filesParsed} files — ${stats.symbolCount} symbols across ${stats.fileCount} files${'\x1b[0m'}  \n`);
+    await indexWorkspaceKitchen(this.cwd).catch((err) => {
+      console.warn('[workspace-kitchen] full index failed:', err.message);
+    });
 
     await this.transport.connect({
       tunnelId: this.tunnelId,
       cwdName: basename(this.cwd),
+      rootPath: this.cwd,
       platform: process.platform,
       pid: process.pid,
       capabilities: {
         files: true,
         terminal: true,
         workspaceBrain: true,
+        workspaceKitchen: true,
         index: true,
         env: true,
       },
@@ -189,11 +173,14 @@ export class LucenaAgent {
           this.stripCwd = data.stripCwd;
         }
         if (data.proToken) {
-          await storeProToken({ tokenForPro: data.proToken, email: data.proEmail });
-          console.log(`  ${'\x1b[36m'}PRO token stored. Future runs can auto-launch.${'\x1b[0m'}`);
-          if (this.remoteControlRegistrationNotice) {
-            console.log(this.remoteControlRegistrationNotice);
-            this.remoteControlRegistrationNotice = '';
+          const existing = await readStoredProToken();
+          const tokenChanged = existing?.tokenForPro !== data.proToken;
+          if (tokenChanged) {
+            await storeProToken({ tokenForPro: data.proToken, email: data.proEmail });
+          }
+          if (tokenChanged && !this.proTokenNoticeShown) {
+            console.log(`  ${'\x1b[36m'}PRO token stored. Future runs can auto-launch.${'\x1b[0m'}`);
+            this.proTokenNoticeShown = true;
           }
         }
       },
@@ -220,6 +207,7 @@ export class LucenaAgent {
       this.transport.sendPresence({
         lastHeartbeatAt: Date.now(),
         cwdName: basename(this.cwd),
+        rootPath: this.cwd,
         status: 'active',
         online: true,
         pid: process.pid,
@@ -283,6 +271,11 @@ export class LucenaAgent {
       case 'workspace_brain_save_state': return this.workspaceBrainSaveStateCmd(command);
       case 'workspace_brain_get_thread': return this.workspaceBrainGetThreadCmd(command);
       case 'workspace_brain_upsert_thread': return this.workspaceBrainUpsertThreadCmd(command);
+      case 'workspace_kitchen_sqlite_exists': return this.workspaceKitchenSqliteExistsCmd(command);
+      case 'workspace_kitchen_read_sqlite': return this.workspaceKitchenReadSqliteCmd(command);
+      case 'workspace_kitchen_index_workspace': return this.workspaceKitchenIndexWorkspaceCmd(command);
+      case 'workspace_kitchen_index_path': return this.workspaceKitchenIndexPathCmd(command);
+      case 'workspace_kitchen_remove_path': return this.workspaceKitchenRemovePathCmd(command);
       case 'workspace_env_set': return this.workspaceEnvSetCmd(command);
       case 'workspace_env_has': return this.workspaceEnvHasCmd(command);
       case 'list_files': return this.listFiles(command);
@@ -304,6 +297,7 @@ export class LucenaAgent {
       linkStatus: 'local',
       platform: process.platform,
       projectName: basename(this.cwd),
+      rootPath: this.cwd,
       syncStatus: 'ready',
       chatStatus: 'idle',
       workerStatus: 'online',
@@ -341,15 +335,15 @@ export class LucenaAgent {
 
   async executeCommand(commandPayload) {
     const { messageId, command, mode = 'safe', approved = false, outsideWorkspaceApproved = false } = commandPayload;
-    let child;
     const sessionId = messageId;
     const owner = this.terminalOwner(commandPayload);
     const ownerRunId = owner.ownerRunId;
     let session = null;
     let settled = false;
     let boundaryTimer = null;
+    let cleanupListeners = () => {};
 
-    const foreground = this.terminalRegistry.foregroundSession(ownerRunId);
+    const foreground = this.terminalCore.foregroundSession(ownerRunId);
     if (foreground) {
       const boundary = terminalSessionSnapshot(foreground, { reason: 'existing_foreground_terminal_session' });
       return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
@@ -362,7 +356,7 @@ export class LucenaAgent {
       });
     }
 
-    const reusable = this.terminalRegistry.findReusable({ command, cwd: this.cwd });
+    const reusable = this.terminalCore.findReusable({ command, cwd: this.cwd });
     if (reusable) {
       const boundary = terminalSessionSnapshot(reusable, { reason: 'existing_matching_background_session' });
       return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
@@ -376,27 +370,25 @@ export class LucenaAgent {
     }
 
     try {
-      child = this.shell.execute(command, { mode, approved, outsideWorkspaceApproved });
+      const decision = this.shell.canExecute(command, { mode, approved, outsideWorkspaceApproved });
+      if (!decision.ok) throw new Error(decision.reason);
     } catch (err) {
       return this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }
 
-    session = this.terminalRegistry.create({
+    session = this.terminalCore.start({
       id: sessionId,
       command,
       cwd: this.cwd,
       ownerRunId,
-      child,
     });
 
     const finishBoundary = (boundary) => {
       if (!boundary || settled) return;
       settled = true;
       if (boundaryTimer) clearTimeout(boundaryTimer);
-      this.terminalRegistry.releaseForeground(sessionId);
-      if (boundary.status === 'ready_background' || boundary.status === 'running' || boundary.status === 'blocked_for_input') {
-        child.__lucenaBackgroundReceiptSent = true;
-      }
+      cleanupListeners();
+      this.terminalCore.releaseForeground(sessionId);
       this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
         exitCode: boundary.exitCode ?? (boundary.status === 'failed' ? 1 : 0),
         terminalStatus: boundary.status,
@@ -405,51 +397,40 @@ export class LucenaAgent {
         detectedUrls: boundary.detectedUrls,
         backgroundProcess: boundary.status === 'ready_background' || boundary.status === 'running' || boundary.status === 'blocked_for_input',
       });
+      if (!['ready_background', 'running', 'blocked_for_input'].includes(boundary.status)) {
+        this.terminalCore.remove(sessionId);
+      }
     };
 
-    const captureOutput = (data, stream) => {
-      const text = data.toString();
-      observeTerminalOutput(session, text, { stream });
-      return text;
+    const onData = ({ session: eventSession, chunk }) => {
+      if (eventSession.id !== sessionId || settled) return;
+      this.pushResponse(messageId, 'output', this._sanitize(String(chunk || '')));
     };
+    const onBoundary = ({ session: eventSession, boundary }) => {
+      if (eventSession.id !== sessionId) return;
+      finishBoundary(boundary);
+    };
+    const onExit = ({ session: eventSession, boundary }) => {
+      if (eventSession.id !== sessionId) return;
+      finishBoundary(boundary);
+    };
+    cleanupListeners = () => {
+      this.terminalCore.off('data', onData);
+      this.terminalCore.off('boundary', onBoundary);
+      this.terminalCore.off('exit', onExit);
+    };
+    this.terminalCore.on('data', onData);
+    this.terminalCore.on('boundary', onBoundary);
+    this.terminalCore.on('exit', onExit);
 
-    child.stdout?.on('data', (data) => {
-      const text = captureOutput(data, 'stdout');
-      if (!settled) this.pushResponse(messageId, 'output', this._sanitize(text));
-      finishBoundary(resolveTerminalBoundary(session));
-    });
-    child.stderr?.on('data', (data) => {
-      const text = captureOutput(data, 'stderr');
-      if (!settled) this.pushResponse(messageId, 'output', this._sanitize(text));
-      finishBoundary(resolveTerminalBoundary(session));
-    });
-
-    if (session.stdinPolicy === 'closed') {
-      try { child.stdin?.end(); } catch { /* already closed */ }
-    }
-
-    child.on('close', (code) => {
-      if (boundaryTimer) clearTimeout(boundaryTimer);
-      finishBoundary(resolveTerminalBoundary(session, { closed: true, exitCode: code ?? 0 }));
-      this.activeCommands.delete(messageId);
-      this.terminalRegistry.close(sessionId, { exitCode: code ?? 0 });
-    });
-
-    this.activeCommands.set(messageId, child);
     boundaryTimer = setTimeout(() => {
-      finishBoundary(resolveTerminalBoundary(session, { force: true }));
+      finishBoundary(this.terminalCore.read(sessionId));
     }, session.longRunning ? session.readyTimeoutMs : session.runningBoundaryTimeoutMs);
   }
 
   async terminalInputCmd({ messageId, sessionId, input = '' }) {
-    const session = this.terminalRegistry.get(sessionId);
-    const child = session?.child || this.activeCommands.get(sessionId);
-    if (!child || child.killed || !child.stdin?.writable) {
-      return this.pushResponse(messageId, 'error', `Terminal session is not accepting input: ${sessionId || 'missing session_id'}`);
-    }
     try {
-      child.stdin.write(String(input ?? ''));
-      const boundary = terminalSessionSnapshot(session, { reason: 'terminal_input_sent' });
+      const boundary = this.terminalCore.write(sessionId, String(input ?? ''));
       return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
         exitCode: boundary.exitCode ?? 0,
         terminalStatus: boundary.status,
@@ -464,17 +445,11 @@ export class LucenaAgent {
   }
 
   async terminalStopCmd({ messageId, sessionId }) {
-    const session = this.terminalRegistry.get(sessionId);
-    const child = session?.child || this.activeCommands.get(sessionId);
-    if (!child) {
+    const boundary = this.terminalCore.stop(sessionId);
+    if (!boundary) {
       return this.pushResponse(messageId, 'done', `Terminal session is not running: ${sessionId || 'missing session_id'}`);
     }
     try {
-      const boundary = session ? terminalSessionSnapshot(session, { reason: 'terminal_session_stopped', status: 'stopped' }) : null;
-      child.kill('SIGTERM');
-      this.activeCommands.delete(sessionId);
-      this.terminalRegistry.remove(sessionId);
-      if (!boundary) return this.pushResponse(messageId, 'done', `Terminal session stopped: ${sessionId}.`);
       return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
         exitCode: boundary.exitCode ?? 0,
         terminalStatus: 'stopped',
@@ -489,11 +464,10 @@ export class LucenaAgent {
   }
 
   async terminalReadCmd({ messageId, sessionId }) {
-    const session = this.terminalRegistry.get(sessionId);
-    if (!session) {
+    const boundary = this.terminalCore.read(sessionId);
+    if (!boundary) {
       return this.pushResponse(messageId, 'error', `Terminal session not found: ${sessionId || 'missing session_id'}`);
     }
-    const boundary = terminalSessionSnapshot(session, { reason: 'terminal_session_read' });
     return this.pushResponse(messageId, 'done', this._sanitize(terminalReceipt(boundary)), {
       exitCode: boundary.exitCode ?? 0,
       terminalStatus: boundary.status,
@@ -523,7 +497,6 @@ export class LucenaAgent {
     if (this._isIgnoredPath(fullPath)) {
       return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
     }
-    const relPath = toBrowserPath(relative(this.cwd, fullPath));
     try {
       let existed = true;
       let originalContent = '';
@@ -537,23 +510,26 @@ export class LucenaAgent {
       await writeFile(fullPath, nextContent, 'utf-8');
       const confirmedContent = await readFile(fullPath, 'utf-8');
       if (confirmedContent !== nextContent) {
-        throw new Error(`Write verification failed for ${relPath}`);
+        throw new Error(`Write verification failed for ${fullPath}`);
       }
+      await indexWorkspaceKitchenPath(this.cwd, fullPath).catch((err) => {
+        console.warn(`[workspace-kitchen] failed to index written file ${fullPath}:`, err?.message || err);
+      });
       if (source) {
         try {
           this.transport.sendEvent('file_change', {
             event: existed ? 'change' : 'add',
-            path: relPath,
+            path: fullPath,
             source,
             originalContent,
             content: nextContent,
             timestamp: Date.now()
           });
         } catch (err) {
-          console.warn(`Failed to publish file change event for ${relPath}:`, err?.message || err);
+          console.warn(`Failed to publish file change event for ${fullPath}:`, err?.message || err);
         }
       }
-      await this.pushResponse(messageId, 'done', `Wrote ${relPath}`);
+      await this.pushResponse(messageId, 'done', this._sanitize(`Wrote ${fullPath}`));
     } catch (err) {
       await this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }
@@ -622,11 +598,60 @@ export class LucenaAgent {
     }
   }
 
+  async workspaceKitchenSqliteExistsCmd({ messageId }) {
+    try {
+      this.pushResponse(messageId, 'done', await workspaceKitchenSqliteExists(this.cwd) ? 'true' : 'false');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceKitchenReadSqliteCmd({ messageId }) {
+    try {
+      const bytes = await readWorkspaceKitchenSqliteBytes(this.cwd);
+      this.pushResponse(messageId, 'output', bytes ? Buffer.from(bytes).toString('base64') : '');
+      this.pushResponse(messageId, 'done', '');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceKitchenIndexWorkspaceCmd({ messageId }) {
+    try {
+      const result = await indexWorkspaceKitchen(this.cwd);
+      this.pushResponse(messageId, 'output', JSON.stringify(result || {}));
+      this.pushResponse(messageId, 'done', '');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceKitchenIndexPathCmd({ messageId, path }) {
+    try {
+      const result = await indexWorkspaceKitchenPath(this.cwd, path || '');
+      this.pushResponse(messageId, 'output', JSON.stringify(result || {}));
+      this.pushResponse(messageId, 'done', '');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
+  async workspaceKitchenRemovePathCmd({ messageId, path }) {
+    try {
+      const result = await removeWorkspaceKitchenPath(this.cwd, path || '');
+      this.pushResponse(messageId, 'output', JSON.stringify(result || {}));
+      this.pushResponse(messageId, 'done', '');
+    } catch (err) {
+      this.pushResponse(messageId, 'error', this._sanitize(err.message));
+    }
+  }
+
   async workspaceEnvSetCmd({ messageId, envKey, value }) {
     try {
       if (!this.shell.setWorkspaceEnv(envKey, value)) {
         return this.pushResponse(messageId, 'error', 'envKey is required');
       }
+      this.terminalCore.setWorkspaceEnv(this.shell.workspaceEnv);
       this.pushResponse(messageId, 'done', `Workspace credential stored as ${String(envKey || '').toUpperCase().replace(/[^A-Z0-9_]+/g, '_')}`);
     } catch (err) {
       this.pushResponse(messageId, 'error', this._sanitize(err.message));
@@ -645,6 +670,12 @@ export class LucenaAgent {
     const normalized = String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
     if (!normalized.startsWith('.WorkspaceBrain/')) return '';
     if (normalized.split('/').includes('..')) return '';
+    if (
+      normalized !== '.WorkspaceBrain/skills'
+      && !normalized.startsWith('.WorkspaceBrain/skills/')
+      && normalized !== '.WorkspaceBrain/memories'
+      && !normalized.startsWith('.WorkspaceBrain/memories/')
+    ) return '';
     return `/${normalized}`;
   }
 
@@ -720,14 +751,16 @@ export class LucenaAgent {
     if (this._isIgnoredPath(fullPath)) {
       return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
     }
-    const relPath = toBrowserPath(relative(this.cwd, fullPath));
     try {
       if ((await stat(fullPath)).isDirectory()) {
         await rm(fullPath, { recursive: true });
       } else {
         await unlink(fullPath);
       }
-      this.pushResponse(messageId, 'done', `Deleted ${relPath}`);
+      await removeWorkspaceKitchenPath(this.cwd, fullPath).catch((err) => {
+        console.warn(`[workspace-kitchen] failed to remove deleted path ${fullPath}:`, err?.message || err);
+      });
+      this.pushResponse(messageId, 'done', this._sanitize(`Deleted ${fullPath}`));
     } catch (err) {
       this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }
@@ -738,10 +771,9 @@ export class LucenaAgent {
     if (this._isIgnoredPath(fullPath)) {
       return this.pushResponse(messageId, 'error', 'Path is not available in this workspace');
     }
-    const relPath = toBrowserPath(relative(this.cwd, fullPath));
     try {
       await mkdir(fullPath, { recursive: true });
-      this.pushResponse(messageId, 'done', `Created ${relPath}`);
+      this.pushResponse(messageId, 'done', this._sanitize(`Created ${fullPath}`));
     } catch (err) {
       this.pushResponse(messageId, 'error', this._sanitize(err.message));
     }
@@ -820,26 +852,23 @@ export class LucenaAgent {
 
       this.transport.sendEvent('file_change', {
         event,
-        path: normalizedRelPath,
+        path: resolve(this.cwd, normalizedRelPath),
         timestamp: Date.now()
       });
 
       // ── Push incremental index delta for changed files ──
       if (event === 'change' || event === 'add') {
         this.pushIndexDelta(normalizedRelPath).catch(() => {}); // Non-blocking, non-fatal
+        indexWorkspaceKitchenPath(this.cwd, resolve(this.cwd, normalizedRelPath)).catch(() => {});
+      } else if (event === 'unlink' || event === 'unlinkDir') {
+        removeWorkspaceKitchenPath(this.cwd, resolve(this.cwd, normalizedRelPath)).catch(() => {});
       }
     });
   }
 
   async shutdown() {
-    for (const [messageId, child] of this.activeCommands) {
-      child.kill('SIGTERM');
-      if (!child.__lucenaBackgroundReceiptSent) {
-        this.pushResponse(messageId, 'error', 'Command killed: tunnel shutting down').catch(() => {});
-      }
-    }
     this.activeCommands.clear();
-    this.terminalRegistry = new TerminalSessionRegistry();
+    this.terminalCore.stopAll();
 
     if (this.watcher) await withTimeout(this.watcher.close(), SHUTDOWN_CLEANUP_TIMEOUT_MS);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);

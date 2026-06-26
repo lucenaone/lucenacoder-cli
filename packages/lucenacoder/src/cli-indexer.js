@@ -396,34 +396,43 @@ export async function buildIndex(cwd, onProgress) {
 
 // ── Single-file re-index (for incremental updates) ──
 
-export async function reindexFile(cwd, relPath) {
+export async function parseWorkspaceFile(cwd, relPath) {
   await initParser();
 
   const workspaceIgnore = createWorkspaceIgnore(cwd);
-  if (workspaceIgnore.ignoresPath(relPath)) return null;
+  const relativePath = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  const cleanRelPath = `/${relativePath}`;
+  if (workspaceIgnore.ignoresPath(relativePath)) return null;
 
-  const ext = extname(relPath);
+  const ext = extname(cleanRelPath);
   const langName = LANGUAGE_MAP[ext];
   if (!langName) return null;
 
-  const fullPath = join(cwd, relPath.replace(/^\//, ''));
-  if (!existsSync(fullPath)) return { filePath: relPath, symbols: [] };
+  const fullPath = join(cwd, cleanRelPath.replace(/^\//, ''));
+  if (!existsSync(fullPath)) return { filePath: cleanRelPath, content: null, chunks: [] };
 
+  const code = await readFile(fullPath, 'utf-8');
+  const lang = await loadLanguage(ext);
+  const parser = new _Parser();
+  parser.setLanguage(lang);
+  const tree = parser.parse(code);
+  const { chunks } = extractChunks(tree.rootNode, code);
+  tree.delete();
+  return { filePath: cleanRelPath, content: code, chunks };
+}
+
+export async function reindexFile(cwd, relPath) {
   try {
-    const code = await readFile(fullPath, 'utf-8');
-    const lang = await loadLanguage(ext);
-    const parser = new _Parser();
-    parser.setLanguage(lang);
-    const tree = parser.parse(code);
-    const { chunks } = extractChunks(tree.rootNode, code);
-    tree.delete();
+    const parsed = await parseWorkspaceFile(cwd, relPath);
+    if (!parsed) return null;
+    if (parsed.content === null) return { filePath: parsed.filePath, symbols: [] };
 
     const symbolEntries = [];
-    for (const chunk of chunks) {
+    for (const chunk of parsed.chunks) {
       if (chunk.type === 'import') continue;
       symbolEntries.push({
         name: chunk.name,
-        filePath: relPath,
+        filePath: parsed.filePath,
         type: chunk.type,
         exported: chunk.exported || false,
         parent: chunk.parent || null,
@@ -432,7 +441,7 @@ export async function reindexFile(cwd, relPath) {
       });
     }
 
-    return { filePath: relPath, symbols: symbolEntries };
+    return { filePath: parsed.filePath, symbols: symbolEntries };
   } catch (err) {
     console.error(`[cli-indexer] Error re-indexing ${relPath}: ${err.message}`);
     return null;
