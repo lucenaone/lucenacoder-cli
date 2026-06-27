@@ -1,6 +1,6 @@
 {
   "name": "@lucenaone/coder",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Private relay tunnel for connecting LucenaCoder.com to your local folder. Always remains folder scoped while providing full terminal access.",
   "type": "module",
   "bin": {
