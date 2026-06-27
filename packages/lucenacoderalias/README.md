@@ -2,68 +2,69 @@
 
 The official local connection agent for [LucenaCoder](https://lucenacoder.com).
 
-Run it from a project folder when you want LucenaCoder to work with files on your machine instead of a browser-only workspace. It creates a folder-scoped realtime tunnel between your local project and LucenaCoder.
+Run it from a project folder when you want LucenaCoder to work with the files on your machine. The CLI creates a folder-scoped WebSocket tunnel between your local project and LucenaCoder, then waits for requests from your connected browser or Remote Control session.
 
 ```bash
 cd your-project
 npx lucenacoder
 ```
 
-## What This Package Does
+## What It Does
 
-- Connects the folder you run it from to LucenaCoder through Firebase Realtime Database.
-- Reads, writes, lists, searches, and runs commands only inside that selected folder.
-- Builds a local code index on your machine so LucenaCoder can understand the project faster.
-- Watches for local file changes and sends file tree/index updates to connected LucenaCoder sessions.
-- Prints a Tunnel ID and LucenaCoder URL so you can connect from the web app.
-- If your Pro token is already saved, registers the tunnel with your LucenaCoder account for Remote Control.
+- Connects the current folder to LucenaCoder through the LucenaCoder tunnel broker.
+- Lets connected LucenaCoder sessions read, write, list, search, and inspect files in that folder.
+- Runs terminal commands from that folder, with Safe Mode approval checks on by default.
+- Builds local project indexes so LucenaCoder can navigate the codebase faster.
+- Watches for local file changes and sends updates to connected sessions.
+- Prints a Tunnel ID and URL you can use to connect from LucenaCoder.
+- If a Pro token is saved, registers the tunnel for Remote Control.
 
-That is the whole job: this package is the lightweight local worker. The AI/model calls and Pro account checks live in LucenaCoder's cloud services.
+That is the core job of this package: it is the lightweight local worker. Model calls, account checks, and Pro Remote Control coordination live in LucenaCoder's cloud services.
+
+## How It Works
+
+When the CLI starts, it indexes the project locally, opens a secure WebSocket connection to LucenaCoder's tunnel broker, and announces the tunnel with a temporary Tunnel ID. A LucenaCoder browser or Remote Control session can then connect to that tunnel and ask the local worker to perform folder-scoped actions.
+
+The tunnel is live only while the terminal process is running. Stop it with `Ctrl+C`.
 
 ## What Gets Sent
 
-We want this to be boringly clear:
+LucenaCoder needs enough information to show and operate the tunnel:
 
-- The folder name, platform, process id, Tunnel ID, and tunnel status are sent so LucenaCoder can show and connect the session.
-- File paths, file contents, search results, command output, and file change events are sent when a connected LucenaCoder session asks for them.
-- A local code index is generated on your machine and can be sent to your connected LucenaCoder browser session to make navigation and context faster.
-- For Pro Remote Control, prompts go to LucenaCoder's cloud relay, model/tool decisions happen there, and this local worker receives folder-scoped tool requests.
-- Your OpenRouter key is not stored in this npm package. Pro model access is resolved by LucenaCoder cloud services from your account.
+- Basic session metadata such as folder name, platform, process id, Tunnel ID, status, and connection heartbeat.
+- Project structure and local index data used for navigation and context.
+- File paths, file contents, search results, file change events, and command output when a connected session asks for them.
+- For Pro Remote Control, the local worker receives tool requests through LucenaCoder's relay while model decisions happen in LucenaCoder cloud services.
 
-## What Does Not Happen
-
-- This does not scan your whole computer.
-- LucenaCoder file tools are scoped to the directory where you ran `npx lucenacoder`.
-- This does not run a hidden background daemon after you close the terminal process.
-- The Tunnel ID is a private connection handle; treat it like a temporary secret.
-
-## Browser Mode, Local Tunnel, And Pro Remote Control
-
-LucenaCoder can work in a few modes:
-
-- Browser Mode keeps work inside the browser sandbox.
-- Local Tunnel uses this package to connect LucenaCoder to the folder on your machine.
-- Pro Remote Control uses the same local tunnel worker, but the relay goes through LucenaCoder cloud services so you can control the session from mobile while `npx lucenacoder` keeps running on your machine. This allows Pro users to close the desktop tab while mobile maintains access.
+Your OpenRouter key is not stored in this npm package. Pro model access is resolved by LucenaCoder cloud services from your account.
 
 ## Safety Model
 
-Local AI access should not be mysterious.
+Local access should be powerful, but not mysterious.
 
-- LucenaCoder file tools are folder-scoped and resolve paths inside the folder where the command was started, but agents are able to access beyond upon request.
-- Safe Mode is the default. Mutating terminal commands are blocked until approved.
-- Terminal commands run from the selected project folder. Read-only shell commands can still reference paths you explicitly ask them to, so review commands before approving broader access.
-- File edits are surfaced through LucenaCoder's approval flow when approval is required.
-- YOLO Mode can be enabled from the LucenaCoder interface when you intentionally want fewer interruptions.
-- The local shell runner still enforces path and command checks. UI approval is not the only line of defense.
+- File operations are scoped to the folder where you started `npx lucenacoder`.
+- The worker honors internal ignores, common build/cache folders, and your `.gitignore`.
+- Safe Mode is on by default. Mutating terminal commands require approval.
+- YOLO Mode can be enabled from LucenaCoder when you intentionally want fewer interruptions.
+- The local shell runner still checks commands and paths. UI approval is not the only line of defense.
+- Read-only terminal commands may reference explicit paths you ask for, so review commands before approving broader access.
 
-No local safety system is magic. Review prompts and approvals before allowing broad changes, dependency scripts, migrations, or commands you do not understand.
+No local safety system is magic. Review prompts and approvals before allowing broad changes, dependency scripts, migrations, deploys, or commands you do not understand.
+
+## Modes
+
+LucenaCoder can work in a few ways:
+
+- Browser Mode keeps work inside the browser sandbox.
+- Local Tunnel uses this package to connect LucenaCoder to a folder on your machine.
+- Pro Remote Control uses the same local tunnel worker, plus LucenaCoder cloud services, so you can control a running local session from another device.
 
 ## Requirements
 
 - Node.js 20 or newer.
-- Internet access to LucenaCoder and Firebase Realtime Database.
-- A LucenaCoder browser session for normal local tunnel use.
-- Active Pro access for Remote Control from mobile.
+- Internet access to LucenaCoder and the LucenaCoder tunnel broker.
+- A LucenaCoder browser session for normal Local Tunnel use.
+- Active Pro access for Remote Control.
 
 ## Common Flow
 
@@ -74,12 +75,14 @@ npx lucenacoder
 
 Then either:
 
-- Open the printed LucenaCoder URL, or
-- Paste the Tunnel ID into LucenaCoder's Local Tunnel picker, or
+- Open the printed LucenaCoder URL.
+- Paste the Tunnel ID into LucenaCoder's Local Tunnel picker.
 - If Pro is active, open Remote Control from your LucenaCoder account and choose the connected tunnel.
 
 To disconnect, stop the process with `Ctrl+C`.
 
 ## Package Transparency
 
-This npm package contains the local tunnel worker, local indexing code, shell safety policy, and tree-sitter grammars needed to run on your machine. 
+This npm package contains the local tunnel worker, local indexing code, shell safety policy, terminal runner, Workspace Brain and Workspace Kitchen local storage helpers, and tree-sitter grammars needed to run on your machine.
+
+The public `lucenacoder` package is a convenience alias for `@lucenaone/coder`.

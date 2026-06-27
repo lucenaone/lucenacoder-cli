@@ -1,8 +1,3 @@
-// src/cli-indexer.js — Tree-sitter WASM indexer for the CLI agent
-// Runs on the user's machine at startup, parses all code files locally,
-// and builds a symbol index that can be pushed to the browser
-// via RTDB when the tunnel connects.
-
 import { readFile, readdir, stat } from 'fs/promises';
 import { join, extname, relative } from 'path';
 import { existsSync } from 'fs';
